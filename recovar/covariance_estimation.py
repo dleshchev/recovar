@@ -458,13 +458,8 @@ def compute_H_B_in_volume_batch(cryo, mean, dilated_volume_mask, picked_frequenc
     image_batch_size = utils.get_image_batch_size(cryo.grid_size, gpu_memory) // (2 if options['disc_type'] =='cubic' else 1)
     column_batch_size = utils.get_column_batch_size(cryo.grid_size, gpu_memory)
 
-    # if batch_over_image_only:
-    #     return compute_H_B(cryo, mean, dilated_volume_mask,
-    #                                                              picked_frequencies,
-    #                                                              int(image_batch_size ), (cov_noise),
-    #                                                              None , disc_type = disc_type,
-    #                                                              parallel_analysis = parallel_analysis,
-    #                                                              jax_random_key = 0, batch_over_H_B = True)
+    # Check if multi-GPU should be used
+    n_gpus = _get_n_usable_gpus_for_covariance(cryo.volume_size, picked_frequencies.size, cryo.dtype)
 
     H = np.empty( [cryo.volume_size, picked_frequencies.size] , dtype = cryo.dtype)
     B = np.empty( [cryo.volume_size, picked_frequencies.size] , dtype = cryo.dtype)
@@ -473,19 +468,105 @@ def compute_H_B_in_volume_batch(cryo, mean, dilated_volume_mask, picked_frequenc
     for k in range(0, int(np.ceil(picked_frequencies.size/frequency_batch))):
         batch_st = int(k * frequency_batch)
         batch_end = int(np.min( [(k+1) * frequency_batch ,picked_frequencies.size  ]))
-        # logger.info(f'outside H_B : {batch_st}, {batch_end}')
-        # utils.report_memory_device(logger = logger)
-        H_batch, B_batch = compute_H_B(cryo, mean, dilated_volume_mask,
-                                                                 picked_frequencies[batch_st:batch_end],
-                                                                 int(image_batch_size / 1),
-                                                                 None ,
-                                                                 parallel_analysis = parallel_analysis,
-                                                                 jax_random_key = 0, options = options, image_subset = image_subset)
+
+        if n_gpus > 1:
+            H_batch, B_batch = _compute_H_B_multi_gpu(
+                cryo, mean, dilated_volume_mask,
+                picked_frequencies[batch_st:batch_end],
+                int(image_batch_size), n_gpus,
+                parallel_analysis=parallel_analysis,
+                options=options, image_subset=image_subset)
+        else:
+            H_batch, B_batch = compute_H_B(cryo, mean, dilated_volume_mask,
+                                                                     picked_frequencies[batch_st:batch_end],
+                                                                     int(image_batch_size / 1),
+                                                                     None ,
+                                                                     parallel_analysis = parallel_analysis,
+                                                                     jax_random_key = 0, options = options, image_subset = image_subset)
         H[:, batch_st:batch_end]  = np.array(H_batch)
         B[:, batch_st:batch_end]  = np.array(B_batch)
         del H_batch, B_batch
-        
+
     return H,B
+
+
+def _get_n_usable_gpus_for_covariance(volume_size, n_freq_cols, dtype):
+    """Determine how many GPUs can be used for covariance computation.
+    Each GPU must hold full H/B arrays for the frequency columns being computed.
+    Falls back to 1 GPU if memory is too tight."""
+    try:
+        devices = jax.devices("gpu")
+    except RuntimeError:
+        return 1
+    n_gpus = len(devices)
+    if n_gpus <= 1:
+        return 1
+    # Each GPU needs H + B arrays: 2 * volume_size * n_freq_cols * itemsize
+    itemsize = np.dtype(dtype).itemsize
+    mem_per_gpu = 2 * volume_size * n_freq_cols * itemsize
+    # Use at most 70% of GPU memory for H/B arrays
+    try:
+        gpu_memory_bytes = utils.get_gpu_memory_total() * 1e9 * 0.7
+    except Exception:
+        return 1
+    if mem_per_gpu > gpu_memory_bytes:
+        logger.info(f"Multi-GPU disabled for covariance: H/B need {mem_per_gpu/1e9:.1f} GB per GPU, only {gpu_memory_bytes/1e9:.1f} GB available")
+        return 1
+    logger.info(f"Using {n_gpus} GPUs for covariance computation")
+    return n_gpus
+
+
+def _compute_H_B_multi_gpu(cryo, mean, dilated_volume_mask, picked_frequencies,
+                           image_batch_size, n_gpus, parallel_analysis=False,
+                           options=None, image_subset=None):
+    """Multi-GPU covariance H/B via image splitting + sum-reduce.
+    Each GPU processes a disjoint subset of images for the same frequency columns."""
+    import concurrent.futures
+
+    devices = jax.devices("gpu")[:n_gpus]
+    n_images = len(image_subset) if image_subset is not None else cryo.n_images
+
+    # Split images across GPUs
+    from recovar.multi_gpu_utils import split_indices_for_gpus
+    if image_subset is not None:
+        gpu_splits = split_indices_for_gpus(len(image_subset), n_gpus)
+        image_indices_per_gpu = [image_subset[s] for s in gpu_splits]
+    else:
+        gpu_splits = split_indices_for_gpus(n_images, n_gpus)
+        image_indices_per_gpu = gpu_splits
+
+    results_H = [None] * n_gpus
+    results_B = [None] * n_gpus
+
+    def compute_on_device(gpu_id, device, img_indices):
+        with jax.default_device(device):
+            H, B = compute_H_B(cryo, mean, dilated_volume_mask,
+                               picked_frequencies,
+                               int(image_batch_size),
+                               None,
+                               parallel_analysis=parallel_analysis,
+                               jax_random_key=0, options=options,
+                               image_subset=img_indices)
+            results_H[gpu_id] = np.array(H)
+            results_B[gpu_id] = np.array(B)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_gpus) as executor:
+        futures = []
+        for gpu_id, (device, indices) in enumerate(zip(devices, image_indices_per_gpu)):
+            futures.append(executor.submit(compute_on_device, gpu_id, device, indices))
+        concurrent.futures.wait(futures)
+        for future in futures:
+            if future.exception() is not None:
+                raise future.exception()
+
+    # Sum-reduce across GPUs
+    H_total = results_H[0]
+    B_total = results_B[0]
+    for i in range(1, n_gpus):
+        H_total = H_total + results_H[i]
+        B_total = B_total + results_B[i]
+
+    return H_total, B_total
 
 
     
