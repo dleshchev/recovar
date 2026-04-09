@@ -436,14 +436,14 @@ def compute_variance(cryos, mean_estimate, batch_size, volume_mask, image_subset
 
 
 
-def compute_both_H_B(cryos, means, dilated_volume_mask, picked_frequencies, gpu_memory, parallel_analysis, options ):
+def compute_both_H_B(cryos, means, dilated_volume_mask, picked_frequencies, gpu_memory, parallel_analysis, options, image_subset = None ):
     Hs = []
     Bs = []
     st_time = time.time()
 
     for cryo_idx, cryo in enumerate(cryos):
         mean = means["combined"] if options["use_combined_mean"] else means["corrected" + str(cryo_idx)]
-        H, B = compute_H_B_in_volume_batch(cryo, mean, dilated_volume_mask, picked_frequencies, gpu_memory, parallel_analysis, options = options)
+        H, B = compute_H_B_in_volume_batch(cryo, mean, dilated_volume_mask, picked_frequencies, gpu_memory, parallel_analysis, options = options, image_subset = image_subset)
         logger.info(f"Time to cov {time.time() - st_time}")
         # check_memory()
         Hs.append(H)
@@ -453,7 +453,7 @@ def compute_both_H_B(cryos, means, dilated_volume_mask, picked_frequencies, gpu_
 
 # AT SOME POINT, I CONVINCED MYSELF THAT IT WAS BETTER FOR MEMORY TRANSFER REASONS TO DO THIS IN BATCHES OVER VOLS, THEN OVER IMAGES. I am not sure anymore.
 # Covariance_cols
-def compute_H_B_in_volume_batch(cryo, mean, dilated_volume_mask, picked_frequencies, gpu_memory, parallel_analysis = False, options = None):
+def compute_H_B_in_volume_batch(cryo, mean, dilated_volume_mask, picked_frequencies, gpu_memory, parallel_analysis = False, options = None, image_subset = None):
 
     image_batch_size = utils.get_image_batch_size(cryo.grid_size, gpu_memory) // (2 if options['disc_type'] =='cubic' else 1)
     column_batch_size = utils.get_column_batch_size(cryo.grid_size, gpu_memory)
@@ -480,7 +480,7 @@ def compute_H_B_in_volume_batch(cryo, mean, dilated_volume_mask, picked_frequenc
                                                                  int(image_batch_size / 1),
                                                                  None ,
                                                                  parallel_analysis = parallel_analysis,
-                                                                 jax_random_key = 0, options = options)
+                                                                 jax_random_key = 0, options = options, image_subset = image_subset)
         H[:, batch_st:batch_end]  = np.array(H_batch)
         B[:, batch_st:batch_end]  = np.array(B_batch)
         del H_batch, B_batch
@@ -599,7 +599,7 @@ def compute_covariance_regularization(Hs, Bs, mean_prior, picked_frequencies, co
 
 
 # @functools.partial(jax.jit, static_argnums = [5])    
-def compute_H_B(experiment_dataset, mean_estimate, volume_mask, picked_frequency_indices, batch_size, diag_prior, parallel_analysis = False, jax_random_key = 0, batch_over_H_B = False, soften_mask = 3, options = None ):
+def compute_H_B(experiment_dataset, mean_estimate, volume_mask, picked_frequency_indices, batch_size, diag_prior, parallel_analysis = False, jax_random_key = 0, batch_over_H_B = False, soften_mask = 3, options = None, image_subset = None ):
     # Memory in here scales as O (batch_size )
 
     # utils.report_memory_device()
@@ -630,7 +630,10 @@ def compute_H_B(experiment_dataset, mean_estimate, volume_mask, picked_frequency
     else:
         these_disc = 'linear_interp'
 
-    data_generator = experiment_dataset.get_dataset_generator(batch_size=batch_size, mode='images') 
+    if image_subset is not None:
+        data_generator = experiment_dataset.get_image_subset_generator(batch_size=batch_size, subset_indices=image_subset)
+    else:
+        data_generator = experiment_dataset.get_dataset_generator(batch_size=batch_size, mode='images')
     for images, particles_ind, batch_image_ind in data_generator:
         # these_disc = 'linear_interp'
         # Probably should swap this to linear interp
