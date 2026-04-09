@@ -106,6 +106,15 @@ pipeline-distributed-small = "bash ./scripts/run_test_distributed.sh pipeline 12
 pipeline-distributed-large = "bash ./scripts/run_test_distributed.sh pipeline 256 300000"
 pipeline-distributed-small-lazy = "bash ./scripts/run_test_distributed.sh pipeline 128 100000 lazy"
 
+# Distributed stage tests (per-stage verification)
+test-stage-reference = "bash ./scripts/run_distributed_stage_tests.sh reference 128"
+test-stage-mean = "bash ./scripts/run_distributed_stage_tests.sh run-stage mean 128"
+test-stage-noise = "bash ./scripts/run_distributed_stage_tests.sh run-stage noise_variance 128"
+test-stage-covariance = "bash ./scripts/run_distributed_stage_tests.sh run-stage covariance_hb 128"
+test-stage-embedding = "bash ./scripts/run_distributed_stage_tests.sh run-stage embedding 128"
+compare-stage-mean = "bash ./scripts/run_distributed_stage_tests.sh compare mean 128 100000 1 2"
+compare-stage-covariance = "bash ./scripts/run_distributed_stage_tests.sh compare covariance_hb 128 100000 1 2"
+
 # Comparison tasks
 compare-pipeline-outputs = "python scripts/compare_pipeline_runs.py data-128-100000/test_dataset/pipeline_output data-128-100000/test_dataset/pipeline_output_run2 --output data-128-100000/test_dataset/pipeline_output_run2/comparison"
 

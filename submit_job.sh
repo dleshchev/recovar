@@ -332,6 +332,16 @@ if [ -z "$ACTION" ]; then
     echo "    dist-large-4node     - Distributed pipeline, 4 nodes, 2 GPU/node (2h)"
     echo "    smoke-multinode      - Multi-node smoke test: print rank/world_size (15m)"
     echo ""
+    echo "  Stage-by-stage distributed tests:"
+    echo "    test-stage-ref        - Generate reference checkpoints (1 node, 2h)"
+    echo "    test-stage-mean-1     - Test mean stage, 1 node (30m)"
+    echo "    test-stage-mean-2     - Test mean stage, 2 nodes (30m)"
+    echo "    test-stage-mean-4     - Test mean stage, 4 nodes (30m)"
+    echo "    test-stage-cov-1      - Test covariance H/B stage, 1 node (1h)"
+    echo "    test-stage-cov-2      - Test covariance H/B stage, 2 nodes (1h)"
+    echo "    test-stage-cov-4      - Test covariance H/B stage, 4 nodes (1h)"
+    echo "    test-stage-compare    - Compare all stage test outputs (10m)"
+    echo ""
     echo "  Utilities:"
     echo "    organize-outputs     - Move all slurm-*.out files to scripts/output/"
     echo ""
@@ -464,6 +474,32 @@ case $ACTION in
         ;;
     dist-large-4node)
         submit_multinode_job "Dist Pipeline Large 4-Node" "pixi run pipeline-distributed-large" 2 4 "02:00:00"
+        ;;
+
+    # Stage-by-stage distributed tests
+    test-stage-ref)
+        submit_job "Stage Test Reference" "pixi run test-stage-reference" 1 "02:00:00"
+        ;;
+    test-stage-mean-1)
+        submit_job "Stage Test Mean 1-Node" "pixi run test-stage-mean" 1 "00:30:00"
+        ;;
+    test-stage-mean-2)
+        submit_multinode_job "Stage Test Mean 2-Node" "pixi run test-stage-mean" 1 2 "00:30:00"
+        ;;
+    test-stage-mean-4)
+        submit_multinode_job "Stage Test Mean 4-Node" "pixi run test-stage-mean" 1 4 "00:30:00"
+        ;;
+    test-stage-cov-1)
+        submit_job "Stage Test Covariance 1-Node" "pixi run test-stage-covariance" 1 "01:00:00"
+        ;;
+    test-stage-cov-2)
+        submit_multinode_job "Stage Test Covariance 2-Node" "pixi run test-stage-covariance" 1 2 "01:00:00"
+        ;;
+    test-stage-cov-4)
+        submit_multinode_job "Stage Test Covariance 4-Node" "pixi run test-stage-covariance" 1 4 "01:00:00"
+        ;;
+    test-stage-compare)
+        submit_job "Stage Test Compare" "pixi run compare-stage-mean && pixi run compare-stage-covariance" 1 "00:10:00"
         ;;
 
     # Multi-node smoke test
