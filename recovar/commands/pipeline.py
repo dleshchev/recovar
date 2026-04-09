@@ -313,19 +313,109 @@ def add_args(parser: argparse.ArgumentParser):
 
     parser.add_argument("--no-cleanup", action="store_true", help="Do not clean up temporary files after processing (useful for chaining multiple pipeline calls)")
 
+    parser.add_argument(
+        "--checkpoint-dir",
+        dest="checkpoint_dir",
+        default=None,
+        type=os.path.abspath,
+        help="Checkpoint directory for stage results, enabling resume. "
+             "Default: {outdir}/checkpoint. "
+             "Override with RECOVAR_CHECKPOINT_DIR env var."
+    )
+    parser.add_argument(
+        "--resume-from-stage",
+        dest="resume_from_stage",
+        default=None,
+        type=int,
+        help="Resume from stage N (skip stages 0..N-1, requires their checkpoints)."
+    )
+    parser.add_argument(
+        "--keep-checkpoints",
+        dest="keep_checkpoints",
+        action="store_true",
+        default=False,
+        help="Keep checkpoint directories after successful completion."
+    )
+
     return parser
     
 
+def _resolve_checkpoint_dir(args):
+    """Determine checkpoint directory from CLI > env var > default."""
+    if hasattr(args, 'checkpoint_dir') and args.checkpoint_dir is not None:
+        return args.checkpoint_dir
+    env_dir = os.environ.get("RECOVAR_CHECKPOINT_DIR")
+    if env_dir is not None:
+        return os.path.abspath(env_dir)
+    return os.path.join(args.outdir, "checkpoint")
+
+
 def standard_recovar_pipeline(args):
     from recovar import stages
+    from recovar.stage_checkpoint import StageCheckpoint
 
     st_time = time.time()
 
-    (cryos, ind_split, options, batch_size, gpu_memory, noise_var_from_hf,
-     valid_idx, noise_model, n_repeats, path_mapping, dataset_loader_dict) = stages.stage_setup(args)
+    # Resolve checkpoint directory
+    checkpoint_dir = _resolve_checkpoint_dir(args)
+    use_checkpoints = (hasattr(args, 'checkpoint_dir') and args.checkpoint_dir is not None) or \
+                      os.environ.get("RECOVAR_CHECKPOINT_DIR") is not None or \
+                      (hasattr(args, 'resume_from_stage') and args.resume_from_stage is not None)
+
+    if use_checkpoints:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        logger.info(f"Checkpointing enabled: {checkpoint_dir}")
+
+    def ckpt(name):
+        """Create a StageCheckpoint if checkpointing is enabled, else return None."""
+        if use_checkpoints:
+            return StageCheckpoint(checkpoint_dir, name)
+        return None
+
+    def stage_complete(c):
+        """Check if a stage checkpoint exists and is complete."""
+        return c is not None and c.is_complete()
+
+    # --- Stage 0: Setup ---
+    c_setup = ckpt("stage_00_setup")
+    if stage_complete(c_setup):
+        logger.info("Skipping setup (checkpoint exists)")
+        setup = c_setup.load_object("setup_result")
+        cryos = dataset.get_split_datasets_from_dict(
+            setup['dataset_loader_dict'], setup['ind_split'], args.lazy)
+        ind_split = setup['ind_split']
+        options = setup['options']
+        batch_size = setup['batch_size']
+        gpu_memory = setup['gpu_memory']
+        noise_var_from_hf = setup['noise_var_from_hf']
+        valid_idx = setup['valid_idx']
+        noise_model = setup['noise_model']
+        n_repeats = setup['n_repeats']
+        path_mapping = setup['path_mapping']
+        dataset_loader_dict = setup['dataset_loader_dict']
+        # Re-initialize noise model
+        for cryo in cryos:
+            if noise_model == "radial":
+                cryo.set_radial_noise_model(None)
+            elif noise_model in ('radial_per_tilt', 'radial-per-tilt'):
+                cryo.set_variable_radial_noise_model(None)
+    else:
+        (cryos, ind_split, options, batch_size, gpu_memory, noise_var_from_hf,
+         valid_idx, noise_model, n_repeats, path_mapping, dataset_loader_dict) = stages.stage_setup(args)
+        if c_setup is not None:
+            c_setup.save_object("setup_result", {
+                'ind_split': ind_split, 'options': options,
+                'batch_size': batch_size, 'gpu_memory': gpu_memory,
+                'noise_var_from_hf': noise_var_from_hf,
+                'valid_idx': valid_idx, 'noise_model': noise_model,
+                'n_repeats': n_repeats, 'path_mapping': path_mapping,
+                'dataset_loader_dict': dataset_loader_dict,
+            })
+            c_setup.mark_complete()
 
     contrasts_for_second = None
     for repeat in range(n_repeats):
+        ps = f"_pass{repeat}" if n_repeats > 1 else ""
 
         if repeat == 1:
             contrasts_for_second = stages.apply_contrast_correction(
@@ -333,44 +423,109 @@ def standard_recovar_pipeline(args):
         else:
             contrasts_for_second = None
 
-        means, mean_prior, uninvert_applied = stages.stage_mean(
-            cryos, batch_size, noise_var_from_hf, args, st_time=st_time)
+        # --- Stage 2: Mean ---
+        c_mean = ckpt(f"stage_02_mean{ps}")
+        if stage_complete(c_mean):
+            logger.info("Skipping mean (checkpoint exists)")
+            means = c_mean.load_object("means")
+            mean_prior = c_mean.load_array("mean_prior")
+            uninvert_applied = c_mean.load_config().get("uninvert_applied", False)
+            if uninvert_applied:
+                for cryo in cryos:
+                    cryo.image_stack.mult = -1 * cryo.image_stack.mult
+        else:
+            means, mean_prior, uninvert_applied = stages.stage_mean(
+                cryos, batch_size, noise_var_from_hf, args, st_time=st_time)
+            if c_mean is not None:
+                c_mean.save_object("means", means)
+                c_mean.save_array("mean_prior", mean_prior)
+                c_mean.save_config({"uninvert_applied": uninvert_applied})
+                c_mean.mark_complete()
 
-        volume_mask, dilated_volume_mask, focus_masks = stages.stage_mask(
-            args, means, cryos[0].volume_shape, cryos[0].dtype_real, cryos)
+        # --- Stage 3: Mask ---
+        c_mask = ckpt(f"stage_03_mask{ps}")
+        if stage_complete(c_mask):
+            logger.info("Skipping mask (checkpoint exists)")
+            volume_mask, dilated_volume_mask, focus_masks = c_mask.load_object("mask_result")
+        else:
+            volume_mask, dilated_volume_mask, focus_masks = stages.stage_mask(
+                args, means, cryos[0].volume_shape, cryos[0].dtype_real, cryos)
+            if c_mask is not None:
+                c_mask.save_object("mask_result", (volume_mask, dilated_volume_mask, focus_masks))
+                c_mask.mark_complete()
 
         if args.only_mean:
             return
 
-        # Check if mask is of dtype float32
         if volume_mask.dtype != np.float32:
             raise TypeError(f"volume_mask is not of dtype float32, but {volume_mask.dtype}")
 
-        (noise_var_used, variance_est, variance_fsc, noise_p_variance_est,
-         radial_noise_var_outside_mask, radial_ub_noise_var,
-         white_noise_var_outside_mask, image_PS, std_image_PS,
-         masked_image_PS, std_masked_image_PS,
-         ub_noise_var_by_var_est) = stages.stage_noise_refine_and_variance(
-            cryos[0], cryos, means, batch_size, dilated_volume_mask, args, noise_model)
+        # --- Stage 4: Noise + Variance ---
+        c_noise = ckpt(f"stage_04_noise{ps}")
+        if stage_complete(c_noise):
+            logger.info("Skipping noise/variance (checkpoint exists)")
+            (noise_var_used, variance_est, variance_fsc, noise_p_variance_est,
+             radial_noise_var_outside_mask, radial_ub_noise_var,
+             white_noise_var_outside_mask, image_PS, std_image_PS,
+             masked_image_PS, std_masked_image_PS,
+             ub_noise_var_by_var_est) = c_noise.load_object("noise_result")
+            noise.update_noise_variance(noise_var_used, cryos)
+        else:
+            (noise_var_used, variance_est, variance_fsc, noise_p_variance_est,
+             radial_noise_var_outside_mask, radial_ub_noise_var,
+             white_noise_var_outside_mask, image_PS, std_image_PS,
+             masked_image_PS, std_masked_image_PS,
+             ub_noise_var_by_var_est) = stages.stage_noise_refine_and_variance(
+                cryos[0], cryos, means, batch_size, dilated_volume_mask, args, noise_model)
+            if c_noise is not None:
+                c_noise.save_object("noise_result",
+                    (noise_var_used, variance_est, variance_fsc, noise_p_variance_est,
+                     radial_noise_var_outside_mask, radial_ub_noise_var,
+                     white_noise_var_outside_mask, image_PS, std_image_PS,
+                     masked_image_PS, std_masked_image_PS,
+                     ub_noise_var_by_var_est))
+                c_noise.mark_complete()
 
-        (u, s, covariance_cols, picked_frequencies, column_fscs,
-         covariance_options) = stages.stage_covariance_pca(
-            cryos, options, means, mean_prior, focus_masks,
-            dilated_volume_mask, valid_idx, batch_size, gpu_memory,
-            variance_est, args)
+        # --- Stage 5+6: Covariance + PCA ---
+        c_pca = ckpt(f"stage_06_pca{ps}")
+        if stage_complete(c_pca):
+            logger.info("Skipping covariance/PCA (checkpoint exists)")
+            (u, s, covariance_cols, picked_frequencies, column_fscs,
+             covariance_options) = c_pca.load_object("pca_result")
+        else:
+            (u, s, covariance_cols, picked_frequencies, column_fscs,
+             covariance_options) = stages.stage_covariance_pca(
+                cryos, options, means, mean_prior, focus_masks,
+                dilated_volume_mask, valid_idx, batch_size, gpu_memory,
+                variance_est, args)
+            if c_pca is not None:
+                c_pca.save_object("pca_result",
+                    (u, s, covariance_cols, picked_frequencies, column_fscs,
+                     covariance_options))
+                c_pca.mark_complete()
 
-        zs, cov_zs, est_contrasts = stages.stage_embedding(
-            cryos, means, u, s, volume_mask, gpu_memory, options,
-            focus_masks, noise_var_used)
+        # --- Stage 7: Embedding ---
+        c_embed = ckpt(f"stage_07_embedding{ps}")
+        if stage_complete(c_embed):
+            logger.info("Skipping embedding (checkpoint exists)")
+            zs, cov_zs, est_contrasts = c_embed.load_object("embedding_result")
+        else:
+            zs, cov_zs, est_contrasts = stages.stage_embedding(
+                cryos, means, u, s, volume_mask, gpu_memory, options,
+                focus_masks, noise_var_used)
+            if c_embed is not None:
+                c_embed.save_object("embedding_result", (zs, cov_zs, est_contrasts))
+                c_embed.mark_complete()
 
         if repeat == 1:
             for key in est_contrasts:
                 est_contrasts[key] = est_contrasts[key] * contrasts_for_second
 
+    # --- Stage 8: Save ---
     stages.stage_save(args, cryos, means, u, s, volume_mask,
                       dilated_volume_mask, focus_masks, zs, cov_zs,
                       est_contrasts, noise_var_from_hf, noise_var_used,
-                      None,  # noise_var_from_het_residual computed inside stage_save
+                      None,
                       radial_noise_var_outside_mask, radial_ub_noise_var,
                       white_noise_var_outside_mask, ub_noise_var_by_var_est,
                       image_PS, std_image_PS, masked_image_PS,
@@ -378,6 +533,12 @@ def standard_recovar_pipeline(args):
                       noise_p_variance_est, covariance_cols, covariance_options,
                       column_fscs, picked_frequencies, contrasts_for_second,
                       options, ind_split, path_mapping, st_time)
+
+    # Cleanup checkpoints unless asked to keep
+    if use_checkpoints and not getattr(args, 'keep_checkpoints', False):
+        import shutil
+        logger.info(f"Cleaning up checkpoint directory: {checkpoint_dir}")
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
 
     return means, u, s, volume_mask, dilated_volume_mask, noise_var_used
 
