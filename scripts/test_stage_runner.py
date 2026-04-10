@@ -143,7 +143,11 @@ def run_stage(args):
         elapsed = time.time() - st_time
 
         if node_config.rank == 0:
-            # Save timing
+            # Save result for comparison (single-node path doesn't save to checkpoint)
+            if not ckpt.has_object("means"):
+                ckpt.save_object("means", means)
+                ckpt.save_array("mean_prior", mean_prior)
+                ckpt.mark_complete()
             ckpt.save_config({
                 "stage": "mean", "elapsed_s": elapsed,
                 "world_size": node_config.world_size,
@@ -219,6 +223,11 @@ def run_stage(args):
         elapsed = time.time() - st_time
 
         if node_config.rank == 0:
+            # Save result for comparison (distributed path saves via checkpoint,
+            # but single-node path returns directly without saving)
+            if not ckpt.has_object("covariance_hb_result"):
+                ckpt.save_object("covariance_hb_result", (Hs, Bs))
+                ckpt.mark_complete()
             ckpt.save_config({
                 "stage": "covariance_hb", "elapsed_s": elapsed,
                 "world_size": node_config.world_size,
