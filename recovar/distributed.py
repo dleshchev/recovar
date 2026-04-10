@@ -151,10 +151,14 @@ def compute_frequency_assignments(world_size: int, n_frequencies: int) -> List[F
 def write_partial(path: str, array: np.ndarray) -> None:
     """Atomically write array to .npy file (write .tmp, then rename).
     Uses memmap for arrays > 1 GB to avoid memory doubling."""
-    tmp_path = path + ".tmp"
+    # Ensure path ends with .npy (np.save appends it if missing)
+    if not path.endswith('.npy'):
+        path = path + '.npy'
+    # Use .tmp.npy so np.save doesn't add another .npy extension
+    tmp_path = path[:-4] + '.tmp.npy'
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
     if array.nbytes > 1_000_000_000:
-        # Large array: use memmap to avoid memory doubling
         logger.info(f"Writing large partial ({array.nbytes / 1e9:.1f} GB) via memmap: {path}")
         fp = np.lib.format.open_memmap(tmp_path, mode='w+', dtype=array.dtype, shape=array.shape)
         fp[:] = array
