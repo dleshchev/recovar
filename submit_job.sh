@@ -483,7 +483,7 @@ case $ACTION in
 
     # Multi-node smoke test
     smoke-multinode)
-        submit_multinode_job "Smoke Multi-Node" "python3 scripts/smoke_multinode.py" 1 2 "00:15:00"
+        submit_multinode_job "Smoke Multi-Node" "pixi run smoke-multinode" 1 2 "00:15:00"
         ;;
 
     *)

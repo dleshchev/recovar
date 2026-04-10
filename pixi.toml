@@ -115,6 +115,9 @@ test-stage-embedding = "bash ./scripts/run_distributed_stage_tests.sh run-stage 
 compare-stage-mean = "bash ./scripts/run_distributed_stage_tests.sh compare mean 128 100000 1 2"
 compare-stage-covariance = "bash ./scripts/run_distributed_stage_tests.sh compare covariance_hb 128 100000 1 2"
 
+# Smoke test for multi-node
+smoke-multinode = "python scripts/smoke_multinode.py"
+
 # Comparison tasks
 compare-pipeline-outputs = "python scripts/compare_pipeline_runs.py data-128-100000/test_dataset/pipeline_output data-128-100000/test_dataset/pipeline_output_run2 --output data-128-100000/test_dataset/pipeline_output_run2/comparison"
 
