@@ -170,7 +170,7 @@ fi
 # Launch one container per node via srun.
 # Each node runs scripts/run_node_container.sh which loads from tarball.
 # SLURM_PROCID and SLURM_NTASKS are set by srun for each task.
-srun --ntasks-per-node=1 --export=ALL bash "\$SCRIPT_DIR/scripts/run_node_container.sh"
+srun --ntasks-per-node=1 --export=ALL --cpu-bind=none bash "\$SCRIPT_DIR/scripts/run_node_container.sh"
 
 # Cleanup install marker
 rm -f "\$SCRIPT_DIR/.pixi_install_done_\$SLURM_JOB_ID"
