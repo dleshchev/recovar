@@ -114,6 +114,7 @@ test-stage-covariance = "bash ./scripts/run_distributed_stage_tests.sh run-stage
 test-stage-embedding = "bash ./scripts/run_distributed_stage_tests.sh run-stage embedding 128"
 compare-stage-mean = "bash ./scripts/run_distributed_stage_tests.sh compare mean 128 100000 1 2"
 compare-stage-covariance = "bash ./scripts/run_distributed_stage_tests.sh compare covariance_hb 128 100000 1 2"
+compare-all-stages = "python scripts/compare_all_stages.py"
 
 # Smoke test for multi-node
 smoke-multinode = "python scripts/smoke_multinode.py"
