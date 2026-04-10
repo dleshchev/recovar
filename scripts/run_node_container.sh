@@ -40,7 +40,8 @@ if [ "${SLURM_PROCID}" = "0" ]; then
             pixi install
 
             echo 'Cleaning stale editable installs...'
-            rm -f /workspace/.pixi/envs/default/lib/python3.11/site-packages/__editable__.recovar-*.pth 2>/dev/null || true
+            rm -f /workspace/.pixi/envs/default/lib/python3.11/site-packages/__editable__*recovar* 2>/dev/null || true
+            rm -f /workspace/.pixi/envs/default/lib/python3.11/site-packages/recovar.egg-link 2>/dev/null || true
 
             echo 'Installing RECOVAR...'
             pixi run install-recovar
