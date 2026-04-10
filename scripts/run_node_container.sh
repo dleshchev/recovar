@@ -43,14 +43,19 @@ if [ "${SLURM_PROCID}" = "0" ]; then
             echo 'Install complete.'
         "
     touch "${INSTALL_MARKER}"
+    sync  # Flush to NFS
     echo "Rank 0: Install marker written."
 else
     echo "Rank ${SLURM_PROCID}: Waiting for rank 0 to finish install..."
     for i in $(seq 1 600); do
-        [ -f "${INSTALL_MARKER}" ] && break
+        # Force NFS cache invalidation by listing the directory
+        ls "$(dirname "${INSTALL_MARKER}")" > /dev/null 2>&1
+        if stat "${INSTALL_MARKER}" > /dev/null 2>&1; then
+            break
+        fi
         sleep 1
     done
-    if [ ! -f "${INSTALL_MARKER}" ]; then
+    if ! stat "${INSTALL_MARKER}" > /dev/null 2>&1; then
         echo "ERROR: Timed out waiting for rank 0 install (600s)"
         exit 1
     fi
@@ -75,7 +80,5 @@ docker run --rm --net host --ipc=host \
         echo \"Rank \${SLURM_PROCID}: Task completed!\"
     "
 
-# Cleanup marker (rank 0 only, after all tasks done)
-if [ "${SLURM_PROCID}" = "0" ]; then
-    rm -f "${INSTALL_MARKER}"
-fi
+# Note: marker cleanup is done in the batch script after srun completes,
+# not here, to avoid removing it before rank 1 sees it.
