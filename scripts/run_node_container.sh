@@ -38,12 +38,18 @@ if [ "${SLURM_PROCID}" = "0" ]; then
             set -e
             echo 'Installing dependencies...'
             pixi install
+
+            echo 'Cleaning stale editable installs...'
+            rm -f /workspace/.pixi/envs/default/lib/python3.11/site-packages/__editable__.recovar-*.pth 2>/dev/null || true
+
             echo 'Installing RECOVAR...'
             pixi run install-recovar
             echo 'Install complete.'
         "
     touch "${INSTALL_MARKER}"
     sync  # Flush to NFS
+    # Also force NFS cache invalidation by stat-ing the file
+    stat "${INSTALL_MARKER}" > /dev/null 2>&1
     echo "Rank 0: Install marker written."
 else
     echo "Rank ${SLURM_PROCID}: Waiting for rank 0 to finish install..."
