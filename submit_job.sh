@@ -120,7 +120,11 @@ generate_multinode_batch_script() {
     local ts=$(date +%Y%m%d_%H%M%S)
     local batch_script="$JOB_SCRIPTS_DIR/recovar_mn_${ts}_${pid}.sh"
 
-    cat > "$batch_script" <<EOF
+    # Escape task_cmd for safe embedding in script
+    local escaped_task_cmd
+    escaped_task_cmd=$(printf '%s' "$task_cmd" | sed "s/'/'\\\\''/g")
+
+    cat > "$batch_script" <<BATCHEOF
 #!/bin/bash
 #SBATCH --job-name=recovar-${task_name// /_}
 #SBATCH --output=${OUTPUT_DIR}/slurm-%j.out
@@ -143,29 +147,25 @@ echo "SLURM_JOB_ID: \$SLURM_JOB_ID"
 echo "SLURM_NODELIST: \$SLURM_NODELIST"
 echo "=========================================="
 
-SCRIPT_DIR="${SCRIPT_DIR}"
-CONTAINER_IMAGE="recovar:latest"
-TASK_CMD="${task_cmd}"
+export SCRIPT_DIR="${SCRIPT_DIR}"
+export TASK_CMD='${escaped_task_cmd}'
 
 cd "\$SCRIPT_DIR"
 
 # Build container and save tarball on head node (shared filesystem).
 # Worker nodes will load from tarball instead of rebuilding.
 TARBALL_PATH="\$SCRIPT_DIR/recovar_container.tar"
-if ! docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^recovar:latest\\\$"; then
+if ! docker images --format '{{.Repository}}:{{.Tag}}' | grep -q '^recovar:latest\$'; then
     echo "Container image not found on head node. Building..."
     bash scripts/build_container.sh
 fi
 if [ ! -f "\$TARBALL_PATH" ]; then
     echo "Saving container tarball for worker nodes..."
     docker save recovar:latest -o "\$TARBALL_PATH"
-    echo "Tarball saved: \$(ls -lh "\$TARBALL_PATH" | awk '{print \\\$5}')"
+    echo "Tarball saved"
 else
     echo "Container tarball already exists: \$TARBALL_PATH"
 fi
-
-# Export variables for srun subprocesses
-export SCRIPT_DIR TASK_CMD
 
 # Launch one container per node via srun.
 # Each node runs scripts/run_node_container.sh which loads from tarball.
@@ -176,7 +176,7 @@ echo "=========================================="
 echo "RECOVAR Multi-Node Batch Job Completed"
 echo "Date: \$(date)"
 echo "=========================================="
-EOF
+BATCHEOF
 
     chmod +x "$batch_script"
     echo "$batch_script"
@@ -483,7 +483,7 @@ case $ACTION in
 
     # Multi-node smoke test
     smoke-multinode)
-        submit_multinode_job "Smoke Multi-Node" "python3 -c 'import os; r=os.environ.get(\"SLURM_PROCID\",\"?\"); n=os.environ.get(\"SLURM_NTASKS\",\"?\"); print(f\"Rank {r}/{n} on {os.uname().nodename}\"); import jax; print(f\"Rank {r}: GPUs={jax.device_count()}\")'" 1 2 "00:15:00"
+        submit_multinode_job "Smoke Multi-Node" "python3 scripts/smoke_multinode.py" 1 2 "00:15:00"
         ;;
 
     *)
