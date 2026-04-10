@@ -149,49 +149,28 @@ TASK_CMD="${task_cmd}"
 
 cd "\$SCRIPT_DIR"
 
-# Build container if needed (on head node only before srun)
-if ! docker images | grep -q "recovar.*latest"; then
-    echo "Container image not found. Building..."
+# Build container and save tarball on head node (shared filesystem).
+# Worker nodes will load from tarball instead of rebuilding.
+TARBALL_PATH="\$SCRIPT_DIR/recovar_container.tar"
+if ! docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^recovar:latest\\\$"; then
+    echo "Container image not found on head node. Building..."
     bash scripts/build_container.sh
+fi
+if [ ! -f "\$TARBALL_PATH" ]; then
+    echo "Saving container tarball for worker nodes..."
+    docker save recovar:latest -o "\$TARBALL_PATH"
+    echo "Tarball saved: \$(ls -lh "\$TARBALL_PATH" | awk '{print \\\$5}')"
 else
-    echo "Container image found: \$CONTAINER_IMAGE"
+    echo "Container tarball already exists: \$TARBALL_PATH"
 fi
 
+# Export variables for srun subprocesses
+export SCRIPT_DIR TASK_CMD
+
 # Launch one container per node via srun.
+# Each node runs scripts/run_node_container.sh which loads from tarball.
 # SLURM_PROCID and SLURM_NTASKS are set by srun for each task.
-srun --ntasks-per-node=1 bash -c '
-    echo "Task \$SLURM_PROCID of \$SLURM_NTASKS on \$(hostname)"
-
-    # Build container on this node if not present
-    if ! docker images | grep -q "recovar.*latest"; then
-        echo "Building container on \$(hostname)..."
-        bash ${SCRIPT_DIR}/scripts/build_container.sh
-    fi
-
-    docker run --rm --net host --ipc=host \
-        --runtime=nvidia \
-        -v "${SCRIPT_DIR}":/workspace \
-        -w /workspace \
-        --user $(id -u):$(id -g) \
-        -e SLURM_PROCID=\$SLURM_PROCID \
-        -e SLURM_NTASKS=\$SLURM_NTASKS \
-        -e SLURM_JOB_ID=\$SLURM_JOB_ID \
-        -e SLURM_NODELIST=\$SLURM_NODELIST \
-        "\$CONTAINER_IMAGE" \
-        -c "
-            set -e
-            echo \"Rank \\\$SLURM_PROCID: Installing dependencies...\"
-            pixi install
-
-            echo \"Rank \\\$SLURM_PROCID: Installing RECOVAR...\"
-            pixi run install-recovar
-
-            echo \"Rank \\\$SLURM_PROCID: Running task: \$TASK_CMD\"
-            \$TASK_CMD
-
-            echo \"Rank \\\$SLURM_PROCID: Task completed!\"
-        "
-'
+srun --ntasks-per-node=1 --export=ALL bash "\$SCRIPT_DIR/scripts/run_node_container.sh"
 
 echo "=========================================="
 echo "RECOVAR Multi-Node Batch Job Completed"
@@ -504,7 +483,7 @@ case $ACTION in
 
     # Multi-node smoke test
     smoke-multinode)
-        submit_multinode_job "Smoke Multi-Node" "python3 -c \"import os; print(f'Rank {os.environ.get(\\\"SLURM_PROCID\\\", 0)} of {os.environ.get(\\\"SLURM_NTASKS\\\", 1)} on {os.uname().nodename}')\"" 1 2 "00:15:00"
+        submit_multinode_job "Smoke Multi-Node" "python3 -c 'import os; r=os.environ.get(\"SLURM_PROCID\",\"?\"); n=os.environ.get(\"SLURM_NTASKS\",\"?\"); print(f\"Rank {r}/{n} on {os.uname().nodename}\"); import jax; print(f\"Rank {r}: GPUs={jax.device_count()}\")'" 1 2 "00:15:00"
         ;;
 
     *)
