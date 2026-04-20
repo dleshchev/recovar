@@ -3,11 +3,15 @@ import jax.numpy as jnp
 import numpy as np
 import jax, time
 import functools
+import nvtx
 from recovar import core, covariance_core, regularization, utils, constants, noise, cubic_interpolation
 from recovar.fourier_transform_utils import fourier_transform_utils
 ftu = fourier_transform_utils(jnp)
 
 logger = logging.getLogger(__name__)
+
+# NVTX profiling domain for covariance H/B computation
+NVTX_DOMAIN_H_B = "compute_H_B"
 
 def get_default_covariance_computation_options(grid_size=None):
 
@@ -234,23 +238,31 @@ def compute_regularized_covariance_columns_in_batch(cryos, means, mean_prior, vo
     return covariance_cols, picked_frequencies, fscs
 
 
-def compute_regularized_covariance_columns(cryos, means, mean_prior, volume_mask, dilated_volume_mask, valid_idx, gpu_memory,  options, picked_frequencies):
+def regularize_covariance_columns(Hs, Bs, cryo, mean_prior, volume_mask, valid_idx, gpu_memory, options, picked_frequencies):
+    """Regularize pre-computed H/B matrices into covariance columns.
 
-    cryo = cryos[0]
-    volume_shape = cryos[0].volume_shape
+    This is the regularization half of the old compute_regularized_covariance_columns,
+    separated so that distributed H/B computation can feed directly into it.
 
-    # These options should probably be left as is.
-    mask_ls = dilated_volume_mask
+    Args:
+        Hs: List of H matrices [H_half0, H_half1].
+        Bs: List of B matrices [B_half0, B_half1].
+        cryo: Primary cryo dataset (cryos[0]), for dtype and noise.
+        mean_prior: Mean prior array.
+        volume_mask: Mask for regularization (focus mask in multi-mask case).
+        valid_idx: Valid frequency indices.
+        gpu_memory: Available GPU memory.
+        options: Covariance computation options.
+        picked_frequencies: Array of picked frequency indices.
+
+    Returns:
+        Tuple of (covariance_cols, picked_frequencies, fscs).
+    """
+    volume_shape = cryo.volume_shape
     mask_final = volume_mask
-    # substract_shell_mean = False 
-    # shift_fsc = False
-    keep_intermediate = False
-    # image_noise_var = noise.make_radial_noise(cov_noise, cryos[0].image_shape)
 
-    utils.report_memory_device(logger = logger)
-    Hs, Bs = compute_both_H_B(cryos, means, mask_ls, picked_frequencies, gpu_memory,  parallel_analysis = False, options = options)
-    st_time = time.time() 
-    volume_noise_var = np.asarray(noise.make_radial_noise(cryos[0].noise.get_average_radial_noise(), cryos[0].volume_shape))
+    st_time = time.time()
+    volume_noise_var = np.asarray(noise.make_radial_noise(cryo.noise.get_average_radial_noise(), cryo.volume_shape))
 
     covariance_cols = {}
     if options["reg_fn"] == "new":
@@ -258,14 +270,11 @@ def compute_regularized_covariance_columns(cryos, means, mean_prior, volume_mask
         utils.report_memory_device(logger = logger)
         covariance_cols["est_mask"], prior, fscs = compute_covariance_regularization_relion_style(Hs, Bs, mean_prior, picked_frequencies, volume_noise_var, mask_final, volume_shape,  gpu_memory, reg_init_multiplier = constants.REG_INIT_MULTIPLIER, options = options)
         covariance_cols["est_mask"] = covariance_cols["est_mask"].T
-        del Hs, Bs
         logger.info("after reg fn")
         utils.report_memory_device(logger = logger)
     elif options["reg_fn"] == "old":
         logger.info("using old covariance reg fn")
-        H_comb, B_comb, prior, fscs = compute_covariance_regularization(Hs, Bs, mean_prior, picked_frequencies, volume_noise_var, mask_final, volume_shape,  gpu_memory, prior_iterations = 3, keep_intermediate = keep_intermediate, reg_init_multiplier = constants.REG_INIT_MULTIPLIER, substract_shell_mean = options["substract_shell_mean"], shift_fsc = options["shift_fsc"])
-
-        del Hs, Bs
+        H_comb, B_comb, prior, fscs = compute_covariance_regularization(Hs, Bs, mean_prior, picked_frequencies, volume_noise_var, mask_final, volume_shape,  gpu_memory, prior_iterations = 3, keep_intermediate = False, reg_init_multiplier = constants.REG_INIT_MULTIPLIER, substract_shell_mean = options["substract_shell_mean"], shift_fsc = options["shift_fsc"])
 
         H_comb = np.stack(H_comb).astype(dtype = cryo.dtype)
         B_comb = np.stack(B_comb).astype(dtype = cryo.dtype)
@@ -274,7 +283,6 @@ def compute_regularized_covariance_columns(cryos, means, mean_prior, volume_mask
         cols2 = []
         for col_idx in range(picked_frequencies.size):
             cols2.append(np.array(regularization.covariance_update_col(H_comb[col_idx], B_comb[col_idx], prior[col_idx]) * valid_idx ))
-            
 
         logger.info(f"cov update time: {time.time() - st_time2}")
         covariance_cols["est_mask"] = np.stack(cols2, axis =-1).astype(cryo.dtype)
@@ -284,6 +292,59 @@ def compute_regularized_covariance_columns(cryos, means, mean_prior, volume_mask
         assert False, "wrong covariance reg fn"
 
     return covariance_cols, picked_frequencies, np.asarray(fscs)
+
+
+def regularize_covariance_columns_in_batch(Hs, Bs, cryo, mean_prior, volume_mask, valid_idx, gpu_memory, options, picked_frequencies):
+    """Batch regularization of pre-computed H/B matrices.
+
+    Same batching logic as compute_regularized_covariance_columns_in_batch,
+    but operates on pre-computed H/B instead of computing them per batch.
+
+    Args:
+        Hs: List of H matrices [H_half0, H_half1], covering all picked_frequencies.
+        Bs: List of B matrices [B_half0, B_half1], covering all picked_frequencies.
+        cryo: Primary cryo dataset (cryos[0]).
+        mean_prior: Mean prior array.
+        volume_mask: Mask for regularization.
+        valid_idx: Valid frequency indices.
+        gpu_memory: Available GPU memory.
+        options: Covariance computation options.
+        picked_frequencies: Array of picked frequency indices.
+
+    Returns:
+        Tuple of (covariance_cols, picked_frequencies, fscs).
+    """
+    frequency_batch = utils.get_column_batch_size(cryo.grid_size, gpu_memory)
+
+    covariance_cols = []
+    fscs = []
+    for k in range(0, int(np.ceil(picked_frequencies.size / frequency_batch))):
+        batch_st = int(k * frequency_batch)
+        batch_end = int(np.min([(k + 1) * frequency_batch, picked_frequencies.size]))
+
+        Hs_batch = [H[:, batch_st:batch_end] for H in Hs]
+        Bs_batch = [B[:, batch_st:batch_end] for B in Bs]
+
+        covariance_cols_b, _, fscs_b = regularize_covariance_columns(
+            Hs_batch, Bs_batch, cryo, mean_prior, volume_mask, valid_idx,
+            gpu_memory, options, picked_frequencies[batch_st:batch_end])
+        logger.info(f'batch of col done: {batch_st}, {batch_end}')
+
+        covariance_cols.append(covariance_cols_b['est_mask'])
+        fscs.append(fscs_b)
+
+    covariance_cols = {'est_mask': np.concatenate(covariance_cols, axis=-1)}
+    fscs = np.concatenate(fscs, axis=0)
+    return covariance_cols, picked_frequencies, fscs
+
+
+def compute_regularized_covariance_columns(cryos, means, mean_prior, volume_mask, dilated_volume_mask, valid_idx, gpu_memory,  options, picked_frequencies):
+
+    utils.report_memory_device(logger = logger)
+    Hs, Bs = compute_both_H_B(cryos, means, dilated_volume_mask, picked_frequencies, gpu_memory,  parallel_analysis = False, options = options)
+    result = regularize_covariance_columns(Hs, Bs, cryos[0], mean_prior, volume_mask, valid_idx, gpu_memory, options, picked_frequencies)
+    del Hs, Bs
+    return result
 
 
 # import functools, jax

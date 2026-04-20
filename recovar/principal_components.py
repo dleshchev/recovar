@@ -12,35 +12,34 @@ logger = logging.getLogger(__name__)
 # h = hpy()
 
 
-def estimate_principal_components(cryos, options,  means, mean_prior, volume_mask,
-                                dilated_volume_mask, valid_idx, batch_size, gpu_memory_to_use,
-                                covariance_options = None, variance_estimate = None, use_reg_mean_in_contrast = False):
-    
-    covariance_options = covariance_estimation.get_default_covariance_computation_options() if covariance_options is None else covariance_options
+def pick_covariance_frequencies(cryos, means, covariance_options, variance_estimate=None):
+    """Select which frequency columns to sample for covariance estimation.
 
+    Extracted from estimate_principal_components so distributed code can
+    pick frequencies without going through the full PCA path.
+
+    Args:
+        cryos: List of cryo datasets.
+        means: Dict of mean volumes (needs 'lhs', 'prior' for SNR schemes).
+        covariance_options: Covariance computation options dict.
+        variance_estimate: Variance estimate array (required for 'high_snr_from_var_est').
+
+    Returns:
+        picked_frequencies: Array of frequency indices to compute.
+    """
     volume_shape = cryos[0].volume_shape
-    vol_batch_size = utils.get_vol_batch_size(cryos[0].grid_size, gpu_memory_to_use)
-
-    # Different way of sampling columns: 
-    # - from low to high frequencies
-    # This is the way it was done in the original code. 
-    # - Highest SNR columns, computed by lhs of mean estimation. May want to not take frequencies that are too similar
-    # - Highest variance columns. Also want want to diversify.
-    # For the last one, could also batch by doing randomized-Cholesky like choice
 
     if covariance_options['column_sampling_scheme'] == 'low_freqs':
         from recovar import covariance_core
-        volume_shape = cryos[0].volume_shape
         if cryos[0].grid_size == 16:
-            picked_frequencies = np.arange(cryos[0].volume_size) 
+            picked_frequencies = np.arange(cryos[0].volume_size)
         else:
             picked_frequencies = np.array(covariance_core.get_picked_frequencies(volume_shape, radius = covariance_options['column_radius'], use_half = True))
-    elif covariance_options['column_sampling_scheme'] == 'high_snr' or covariance_options['column_sampling_scheme'] == 'high_lhs' or covariance_options['column_sampling_scheme'] == 'high_snr_p' or covariance_options['column_sampling_scheme'] =='high_snr_from_var_est':
+    elif covariance_options['column_sampling_scheme'] in ('high_snr', 'high_lhs', 'high_snr_p', 'high_snr_from_var_est'):
         from recovar import regularization
         upsampling_factor = np.round((means['lhs'].size / cryos[0].volume_size)**(1/3)).astype(int)
         upsampled_volume_shape = tuple(upsampling_factor * np.array(volume_shape))
         lhs = regularization.downsample_lhs(means['lhs'].reshape(upsampled_volume_shape), volume_shape, upsampling_factor = upsampling_factor).reshape(-1)
-        # At low freqs, signal variance decays as ~1/rad^2
 
         dist = (ftu.get_grid_of_radial_distances(volume_shape)+1)**2
         if covariance_options['column_sampling_scheme'] == 'high_snr':
@@ -60,11 +59,23 @@ def estimate_principal_components(cryos, options,  means, mean_prior, volume_mas
         logger.info(f"Largest frequency computed: {np.max(np.abs(picked_frequencies_in_frequencies_format))}")
         if np.max(np.abs(picked_frequencies_in_frequencies_format)) > cryos[0].grid_size//2-1:
             logger.warning("Largest frequency computed is larger than grid size//2-1. This may cause big issues in SVD. This probably means variance estimates were wrong")
-        # print("chosen cols", picked_frequencies_in_frequencies_format.T)
-        # import pdb; pdb.set_trace()
     else:
         raise NotImplementedError('unrecognized column sampling scheme')
-    
+
+    return picked_frequencies
+
+
+def estimate_principal_components(cryos, options,  means, mean_prior, volume_mask,
+                                dilated_volume_mask, valid_idx, batch_size, gpu_memory_to_use,
+                                covariance_options = None, variance_estimate = None, use_reg_mean_in_contrast = False):
+
+    covariance_options = covariance_estimation.get_default_covariance_computation_options() if covariance_options is None else covariance_options
+
+    volume_shape = cryos[0].volume_shape
+    vol_batch_size = utils.get_vol_batch_size(cryos[0].grid_size, gpu_memory_to_use)
+
+    picked_frequencies = pick_covariance_frequencies(cryos, means, covariance_options, variance_estimate)
+
     covariance_cols, picked_frequencies, column_fscs = covariance_estimation.compute_regularized_covariance_columns_in_batch(cryos, means, mean_prior, volume_mask, dilated_volume_mask, valid_idx, gpu_memory_to_use, covariance_options, picked_frequencies)
     
     # Check for NaN or Inf values in covariance_cols

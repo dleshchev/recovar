@@ -38,32 +38,8 @@ def add_args(parser: argparse.ArgumentParser):
     from recovar.commands.pipeline import add_args as pipeline_add_args
     pipeline_add_args(parser)
 
-    # Distributed-specific arguments
-    parser.add_argument(
-        "--checkpoint-dir",
-        dest="checkpoint_dir",
-        default=None,
-        type=os.path.abspath,
-        help="Checkpoint directory for stage results. "
-             "Default: {outdir}/checkpoint. "
-             "Override with RECOVAR_CHECKPOINT_DIR env var."
-    )
-    parser.add_argument(
-        "--resume-from-stage",
-        dest="resume_from_stage",
-        default=None,
-        type=int,
-        help="Resume from stage N (skip stages 0..N-1). "
-             "Requires their DONE markers to exist in checkpoint dir."
-    )
-    parser.add_argument(
-        "--keep-checkpoints",
-        dest="keep_checkpoints",
-        action="store_true",
-        default=False,
-        help="Keep checkpoint directories after successful completion. "
-             "Default: delete to save disk space."
-    )
+    # All shared arguments (--checkpoint-dir, --resume-from-stage,
+    # --keep-checkpoints) are already defined by pipeline's add_args.
     return parser
 
 

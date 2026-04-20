@@ -191,7 +191,7 @@ Supports: RELION STAR, CryoSPARC CS, MRC/MRCS, plain text particle lists, and cr
 
 ## Multi-Node Distributed Pipeline (branch: multinode-dev)
 
-### Status: Core implementation complete, stage-by-stage tests passing
+### Status: Core implementation complete, I/O bottleneck identified
 
 The pipeline has been refactored into discrete stage functions (`recovar/stages.py`) and a distributed command (`recovar pipeline_distributed`) added for multi-node execution via file-based coordination on shared filesystem.
 
@@ -214,13 +214,16 @@ The pipeline has been refactored into discrete stage functions (`recovar/stages.
 # Generate reference checkpoints (1 node, ~50 min)
 ./submit_job.sh test-stage-ref
 
-# Test individual stages with N nodes
+# Test individual stages with N ranks
 ./submit_job.sh test-stage-mean-1     # 1 node
 ./submit_job.sh test-stage-mean-2     # 2 nodes
-./submit_job.sh test-stage-mean-4     # 4 nodes
 ./submit_job.sh test-stage-cov-1      # covariance, 1 node
 ./submit_job.sh test-stage-cov-2      # covariance, 2 nodes
-./submit_job.sh test-stage-cov-4      # covariance, 4 nodes
+./submit_job.sh test-stage-cov-4      # covariance, 4 ranks on 1 node
+
+# Profiling distributed stages (nsys + NVTX)
+./submit_job.sh profile-stage-cov-1   # 1 node
+./submit_job.sh profile-stage-cov-2   # 2 nodes
 
 # Compare outputs across node counts
 ./submit_job.sh test-stage-compare
@@ -231,74 +234,99 @@ The pipeline has been refactored into discrete stage functions (`recovar/stages.
 ./submit_job.sh dist-small-4node      # 4 nodes
 ```
 
-### Test Results (128x128, 100k images)
+### Test Results (128x128, 100k images, A100-80GB)
 
-**Correctness (1-node vs 2-node, tolerance 1e-3):**
+**Correctness (1-node vs 2-node, tolerance 1e-3):** All outputs PASS (mean, covariance H/B).
 
-| Output | Relative Error | Status |
-|--------|---------------|--------|
-| Mean combined | 6.31e-08 | PASS |
-| Mean corrected0 | 6.30e-08 | PASS |
-| Mean corrected1 | 1.23e-07 | PASS |
-| Mean prior | 9.45e-05 | PASS |
-| Covariance half0_H | 0 (exact) | PASS |
-| Covariance half0_B | 9.00e-12 | PASS |
-| Covariance half1_H | 2.57e-10 | PASS |
-| Covariance half1_B | 3.53e-11 | PASS |
+**Covariance stage profiling (detailed breakdown):**
 
-**Timing:**
+| Config | Compute | Write partials | Barrier wait | Read/assemble | Total |
+|--------|---------|---------------|-------------|---------------|-------|
+| 1-rank | 570s | — | — | — | **570s** |
+| 2-rank | 313s | 72s (rank 1) | 121s (rank 0) | 102s | **536s** |
+| 4-rank | 196s | 240s (ranks 1-3) | 246s (rank 0) | 666s | **1108s** |
 
-| Stage | 1 Node | 4 Nodes | Notes |
-|-------|--------|---------|-------|
-| Mean | 37.9s | 147.9s | Rank 0 post-processing dominates |
-| Covariance H/B | 590.4s | 502.9s | 15% speedup with freq-splitting |
+**Key finding:** Compute scales perfectly (570→313→196s) but NFS I/O for partials (2.5-5 GB each) dominates at higher rank counts. The 128-box dataset is too small to benefit — I/O overhead exceeds compute savings. The 256-box dataset (8x more compute, similar I/O) should show real speedup.
 
-### Known Issues and Things to Investigate
+**Optimizations applied:**
+- Rank 0 keeps its data in memory (no write-then-re-read of own partials)
+- Non-rank-0 nodes return immediately after writing (no second barrier, no result loading)
+- Assembly uses memmap-backed output arrays (disk-backed, low RAM usage)
+- Test saves use numpy arrays instead of 20GB pickle
 
-1. **Mean stage slower at multi-node:** The image accumulation (~5s) is dwarfed by rank 0's post-processing (prior computation, regularization, uninvert check ~140s). The post-processing is serial and dominates total time. Need to profile what makes the post-processing so slow — `compute_relion_prior` and `post_process_from_filter` are the suspects.
+### Known Issues
 
-2. **Covariance speedup modest (15% at 4 nodes):** The 128-box dataset is small. The 256-box dataset (16.7M volume_size vs 2M) should show more benefit since H/B computation is O(volume_size * n_freq * n_images). Need to test with `data-256-300000`.
+1. **NFS I/O is the primary bottleneck for multi-rank covariance.** Writing/reading 2.5-5 GB partial arrays through NFS takes 20-125s each (variable throughput). For 128-box, I/O overhead exceeds compute savings at 4+ ranks. Need to test 256-box where compute dominates.
 
-3. **Only mean and covariance are actually distributed:** Noise refinement, PCA/SVD, and embedding run on rank 0 only. The plan identifies these as future parallelization targets but they're secondary to covariance (the bottleneck).
+2. **Assembly OOM on low-RAM nodes.** A100-PCIe-40GB nodes have only 32-64 GB system RAM — too little to hold assembled H/B arrays (20 GB for 128-box, ~160 GB for 256-box). Mitigated with memmap-backed assembly (`_assemble_half_to_memmap`), but 32GB nodes still fail. Use high-RAM nodes (128GB+) or the single-node multi-rank mode (`submit_singlenode_multirank_job`).
 
-4. **NFS barrier reliability:** The file-based barrier uses `os.stat()` polling + `os.fsync()` on directory. Worked in testing but NFS attribute caching can cause delays. Recommend `actimeo=0` mount option on the checkpoint directory for production use.
+3. **OpenMP duplicate library crash on multi-rank-per-node.** Multiple Docker containers on one node can hit conflicting OpenMP runtimes. Workaround: `KMP_DUPLICATE_LIB_OK=TRUE` (set in `run_node_container.sh`).
 
-5. **Docker container build/install race:** Multiple SLURM jobs sharing the same `.pixi` env on shared filesystem can conflict. Current fix: rank 0 installs first (with stale editable artifact cleanup), other ranks wait via marker file. Works but fragile — consider pre-building pixi env in Docker image.
+4. **Mean stage slower at multi-node.** Rank 0 post-processing (~140s) dominates the ~5s parallel accumulation.
 
-6. **Pixi editable install conflicts:** Concurrent jobs produce different `__editable__*recovar*` files that go stale. Current mitigation: `rm -f __editable__*recovar*` before install. Root fix: install recovar non-editable in Docker image, or use per-job pixi env paths.
+5. **Mean and covariance+PCA are distributed.** Noise and embedding still run on rank 0 only.
 
-7. **CPU bind errors on some nodes:** `srun` fails with "Unable to satisfy cpu bind request" on nodes with different CPU topologies. Fixed with `--cpu-bind=none` but may reduce performance on NUMA systems.
+6. **Docker install race.** Concurrent SLURM jobs sharing `.pixi` env can conflict. Rank 0 installs first, others wait via marker file.
 
-8. **Tilt series not supported in distributed mode:** Image splitting must respect tilt-series boundaries. Deferred to Phase 2.
+7. **NFS barrier reliability.** File-based barrier uses `os.stat()` polling. Works but NFS attribute caching can cause delays. Timeout is 1800s.
 
-9. **Checkpoint disk usage:** Covariance H/B partials for 256-box can be 10-40 GB each. With 4 nodes × 2 halves, total checkpoint I/O is ~100-200 GB. Need to verify shared filesystem bandwidth is sufficient.
+8. **Tilt series not supported in distributed mode.** Image splitting must respect tilt-series boundaries. Deferred.
 
-10. **`write_partial` had a bug with np.save:** `np.save` appends `.npy` extension, causing atomic rename to fail. Fixed by using `.tmp.npy` suffix. Watch for similar issues with `np.lib.format.open_memmap` for large arrays (>1GB path).
+9. **Final `pipeline_complete` barrier + cleanup race.** Rank 0 cleans up `checkpoint_dir` after the final barrier, but rank 1 may still be polling for rank 0's barrier marker and never see it (cleanup removes it). Pipeline output is correct but the job hangs until SLURM kills it. Workaround: use `--keep-checkpoints` or cancel the job after rank 0 reports completion.
 
 ### Multi-Node Architecture
 
+Two submission modes:
+- **Multi-node:** `submit_multinode_job` — N nodes, 1 rank per node, `--runtime=nvidia`
+- **Single-node multi-rank:** `submit_singlenode_multirank_job` — 1 node, N ranks, `--gpus device=K` per rank (useful when cluster can't schedule N separate GPU nodes)
+
 ```
 submit_job.sh <action>
-  -> sbatch with --nodes=N, --ntasks-per-node=1
-    -> SLURM allocates N nodes
+  -> sbatch with --nodes=N, --ntasks-per-node=M
+    -> SLURM allocates nodes
       -> Head node: builds Docker + saves tarball
-        -> srun launches run_node_container.sh on each node
-          -> Each node: loads tarball, rank 0 installs pixi env
-            -> All ranks: docker run with SLURM_PROCID/NTASKS/JOB_ID
-              -> recovar pipeline_distributed (or test stage runner)
-                -> Stage-by-stage execution with file-based barriers
+        -> srun launches run_node_container.sh per rank
+          -> Each rank: docker run with GPU pinning + SLURM env vars
+            -> recovar pipeline_distributed (or test stage runner)
+              -> Stage-by-stage execution with file-based barriers
 ```
+
+### NVTX Profiling
+
+Two NVTX domains for Nsight Systems profiling:
+- `compute_H_B` — JAX compute kernels, GPU transfers, multi-GPU orchestration
+- `distributed` — partial I/O, barriers, assembly, checkpoint save/load
+
+Run `./submit_job.sh profile-stage-cov-{1,2}` for nsys profiles with both domains enabled.
 
 ### Parallelization Strategy
 
 | Stage | Strategy | Notes |
 |-------|----------|-------|
 | Setup | Rank 0 only | Fast, broadcasts config |
-| Mean | Image-split across nodes | Each rank accumulates partial ft_y/ft_ctf, rank 0 reduces + post-processes |
-| Mask | Rank 0 only | Fast, no image iteration |
-| Noise + Variance | Rank 0 only | Complex internal loop, deferred |
-| Covariance H/B | Frequency-split across nodes | 2 halves × N/2 freq ranges; multi-GPU within each node for image batches |
-| Regularization + PCA | Rank 0 only | Operates on reduced H/B matrices |
-| Projected Covariance | Rank 0 only | Small accumulators (~800MB), deferred |
-| Embedding | Rank 0 only | Fast relative to covariance, deferred |
-| Save | Rank 0 only | Writes params.pkl, embeddings.pkl, volumes |
+| Mean | Image-split | Each rank accumulates partial ft_y/ft_ctf, rank 0 reduces + post-processes |
+| Mask | Rank 0 only | Fast |
+| Noise + Variance | Rank 0 only | Deferred |
+| Covariance+PCA | Frequency-split H/B, rank-0 regularization | All ranks compute distributed H/B (2 halves × N/2 freq ranges) via `distributed_covariance_hb`. Rank 0 then runs regularization, SVD, and rescaling on the assembled H/B. H/B is computed once and reused across all focus masks (it depends on `dilated_volume_mask`, not per-mask `focus_mask`). |
+| Embedding | Rank 0 only | Deferred |
+| Save | Rank 0 only | |
+
+### Covariance+PCA Decomposition
+
+`compute_regularized_covariance_columns` in `covariance_estimation.py` has been decomposed so the H/B step is separable:
+- `compute_both_H_B(cryos, means, dilated_volume_mask, picked_frequencies, ...)` — the compute kernel
+- `regularize_covariance_columns(Hs, Bs, cryo, mean_prior, volume_mask, valid_idx, gpu_memory, options, picked_frequencies)` — pure regularization
+- `regularize_covariance_columns_in_batch(Hs, Bs, ...)` — batches the regularization over frequency columns
+- `compute_regularized_covariance_columns` = `compute_both_H_B` + `regularize_covariance_columns` (unchanged behavior)
+
+`principal_components.pick_covariance_frequencies(cryos, means, covariance_options, variance_estimate)` — extracted from `estimate_principal_components` so distributed code can pick frequencies independently.
+
+`distributed_covariance_pca` (in `distributed_stages.py`) for `world_size > 1`:
+1. All ranks: set up `covariance_options`, pick frequencies (cheap, deterministic)
+2. All ranks: call `distributed_covariance_hb` to compute H/B across nodes
+3. Non-rank-0: wait at barrier, load result
+4. Rank 0: loop over focus masks → `regularize_covariance_columns_in_batch` → SVD → rescaling → contrast correction
+
+### Checkpoint Barrier Race Fix
+
+Previously, distributed stages called `checkpoint.mark_complete()` BEFORE the barrier. If rank 0 finished a stage fast, rank 1 could see the DONE marker via `ckpt.is_complete()` in the pipeline orchestrator, skip the stage (and its barrier), and desync. All distributed stage wrappers (`distributed_mean`, `distributed_mask`, `distributed_noise_refine_and_variance`, `distributed_covariance_pca`, `distributed_embedding`) now call `mark_complete()` AFTER the barrier.
