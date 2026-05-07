@@ -59,8 +59,27 @@ case "$ACTION" in
             --stage "$STAGE"
         ;;
 
+    profile-stage)
+        WORLD_SIZE=${SLURM_NTASKS:-1}
+        RANK=${SLURM_PROCID:-0}
+        OUTPUT_DIR="${DATASET_DIR}/stage_profile_${STAGE}_${WORLD_SIZE}node"
+        PROFILE_OUT="${BASE_DIR}/scripts/output/profile_${STAGE}_${WORLD_SIZE}node_rank${RANK}_$(date +%Y%m%d_%H%M%S)"
+        echo "=== Profiling stage '${STAGE}' with ${WORLD_SIZE} node(s), rank ${RANK} ==="
+        echo "Profile output: ${PROFILE_OUT}.nsys-rep"
+        nsys profile \
+            -t cuda,nvtx \
+            -f true \
+            -d 3600 \
+            --nvtx-domain-include="compute_H_B,distributed" \
+            -o "${PROFILE_OUT}" \
+            python3 ${BASE_DIR}/scripts/test_stage_runner.py run-stage \
+                --stage "$STAGE" \
+                --ref-checkpoint "$REF_CHECKPOINT" \
+                --output-dir "$OUTPUT_DIR"
+        ;;
+
     *)
-        echo "Usage: $0 {reference|run-stage|compare|compare-ref} <stage> [image_size] [n_images] [ref_nodes] [test_nodes]"
+        echo "Usage: $0 {reference|run-stage|compare|compare-ref|profile-stage} <stage> [image_size] [n_images] [ref_nodes] [test_nodes]"
         echo ""
         echo "Stages: mean, noise_variance, covariance_hb, embedding"
         exit 1

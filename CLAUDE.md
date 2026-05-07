@@ -106,12 +106,13 @@ Files: `scripts/run_pipeline_distributed_mpi.py`, `scripts/run_node_container_mp
 5. **Contiguous-column derived datatype** for Gatherv/Send/Recv at `distributed_stages.py:660-700`. At 256-box, `volume_size × n_frequencies ≈ 5e9` overflows MPI int32 count. Solution: `mpi_dtype.Create_contiguous(volume_size).Commit()` so counts/displs are in column units.
 6. **Output dir name uses `MPI.COMM_WORLD.Get_size()`** — `SLURM_JOB_NUM_NODES` not propagated through `mpirun -x`. (`run_pipeline_distributed_mpi.py`)
 7. **`mark_complete()` AFTER barrier** in every distributed stage wrapper. Otherwise rank 0 can write DONE before the barrier, rank 1 sees `is_complete()==True` in the orchestrator and skips the stage (and its barrier), then desyncs.
+8. **Bare `$PRIMARY_IF` in `btl_tcp_if_include`/`oob_tcp_if_include`.** A multi-NIC fallback list (`$PRIMARY_IF,eno1np0,enp226s0f0,...`) breaks OMPI's TCP filter — when any listed name doesn't resolve on a rank the entry is dropped, and the remaining valid entries fail to form a working set, leading to `BTLs attempted: self` / `MPI_ERR_INTERN` even though the head's NIC exists everywhere. Cross-chassis allocations need per-rank PRIMARY_IF detection or `btl_tcp_if_exclude` semantics — not an include list. (`run_node_container_mpi.sh`)
 
 ### Memory and node selection
 
 - `--mem=110G` default (fits 128-box). `--mem=500G` for `dist-large-mpi-*` (256-box H/B ≈ 160 GB).
 - 256-box only schedules on 1TB-RAM A100-80GB-PCIe nodes; multi-node 256-box jobs need same partition.
-- **Excluded** (`SLURM_EXCLUDE`): `ipp1-2160`, `ipp1-1744` (CUDA host alloc fails on low-FreeMem hosts during PCA reg); `ipp1-2029`, `ipp1-2030` (rank 0 SIGKILLed within seconds of `distributed_covariance_hb` — driver/pinned-memory issue).
+- **Excluded** (`SLURM_EXCLUDE`): `ipp1-2160`, `ipp1-1744`, `ipp1-1776` (CUDA host pinned-alloc fails on low-FreeMem hosts during PCA reg / `right_matvec`); `ipp1-2029`, `ipp1-2030` (rank 0 SIGKILLed within seconds of `distributed_covariance_hb` — driver/pinned-memory issue).
 
 ### Verification (vs `pipeline-{small,large}` reference)
 
@@ -142,3 +143,4 @@ Small-dataset deviations are all fp32-band (JAX reduction non-associativity in `
 11. **Variable per-node performance.** ipp1-216x are 3–4× slower at SVD than ipp1-1xxx; default time limit raised to 3h.
 12. **Legacy file-based regression: sign-flipped eigenvectors at `RECOVAR_MPI=0` (`dist-small-1node`).** Phase 4a's `order='F'` H/B allocation (load-bearing for MPI Gatherv) cascades through `regularize_covariance_columns_in_batch`. Documented regression in the path being retired; not blocking the MPI path.
 13. **picked_frequencies near-tie pick flip is fp32 noise, not orchestration drift.** Set diff is 0/300 for MPI 1+2-node vs reference and 2/300 for MPI 4-node and legacy 1-node. Cross-comparison of `variance_est['combined']` shows rel ∈ [7.7e-7, 4.0e-6] across all 5 paths (ref/legacy/mpi{1,2,4}-node) — JAX reduction non-associativity in `compute_variance` is the noise source. Stable-sort tiebreaks won't help; values aren't equal, just close in fp32.
+14. **2-node SVD anomaly.** `right_matvec_with_spatial_Sigma` (rank-0 GPU work) runs 3–6× slower at 2-node only — same node pair runs fine at 1- or 4-node, and `left_matvec` runs at normal speed in the same job. Highly variable: AX 1 = 482–1418s at 2n vs ~150s at 1n/4n. End-to-end 2-node small (48–69m) is *slower* than 1-node (43m) on this dataset. Hypothesis: MPI BTL-TCP background activity contends with rank-0 host→device staging in `blockwise_A_X`; `left_matvec` doesn't hit it because rank-1 has quiesced by then. Open.

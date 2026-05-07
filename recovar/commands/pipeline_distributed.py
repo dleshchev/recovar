@@ -25,8 +25,16 @@ from recovar.fourier_transform_utils import fourier_transform_utils
 ftu = fourier_transform_utils(jnp)
 
 from recovar.distributed import (
-    NodeConfig, get_node_config_from_env, barrier, broadcast_value
+    NodeConfig, get_node_config_from_env, get_node_config_from_mpi,
+    barrier, broadcast_value,
 )
+
+
+def _use_mpi() -> bool:
+    """Return True iff RECOVAR_MPI=1. Centralizes the gate so callers don't
+    spread the env-var check around. The plan keeps the file-based path live
+    during migration; flipping this to always-True is the final cleanup."""
+    return os.environ.get("RECOVAR_MPI") == "1"
 from recovar.stage_checkpoint import StageCheckpoint
 from recovar import stages
 from recovar import distributed_stages
@@ -57,26 +65,37 @@ def distributed_recovar_pipeline(args):
     """Run the RECOVAR pipeline with multi-node distributed support."""
     st_time = time.time()
 
-    # Get node identity
-    node_config = get_node_config_from_env()
+    # Get node identity. RECOVAR_MPI=1 → bootstrap from MPI.COMM_WORLD;
+    # otherwise read SLURM env vars (the existing file-coordinated path).
+    node_config = get_node_config_from_mpi() if _use_mpi() else get_node_config_from_env()
     checkpoint_dir = resolve_checkpoint_dir(args)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    if not _use_mpi():
+        # Only the file-based path actually writes here; MPI path skips
+        # StageCheckpoint lifecycle entirely.
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    elif node_config.rank == 0 and (args.checkpoint_dir is not None
+                                    or os.environ.get("RECOVAR_CHECKPOINT_DIR")):
+        logger.warning(
+            "RECOVAR_MPI=1: --checkpoint-dir / RECOVAR_CHECKPOINT_DIR are "
+            "ignored (StageCheckpoint lifecycle is bypassed)."
+        )
 
     logger.info(
         f"Distributed pipeline starting: rank={node_config.rank}, "
         f"world_size={node_config.world_size}, "
-        f"checkpoint_dir={checkpoint_dir}"
+        f"checkpoint_dir={checkpoint_dir}, RECOVAR_MPI={_use_mpi()}"
     )
 
-    # --- Stage 0: Setup (rank 0 runs, results broadcast) ---
-    ckpt_setup = StageCheckpoint(checkpoint_dir, "stage_00_setup")
-    if not ckpt_setup.is_complete():
+    # --- Stage 0: Setup (rank 0 runs, descriptor broadcast to all ranks) ---
+    if _use_mpi():
+        # MPI: rank 0 computes setup; bcast the small descriptor (NOT cryos —
+        # workers reload via dataset.get_split_datasets_from_dict below).
+        from mpi4py import MPI
         if node_config.rank == 0:
             (cryos, ind_split, options, batch_size, gpu_memory, noise_var_from_hf,
              valid_idx, noise_model, n_repeats, path_mapping,
              dataset_loader_dict) = stages.stage_setup(args)
-
-            ckpt_setup.save_object("setup_result", {
+            setup = {
                 'ind_split': ind_split,
                 'options': options,
                 'batch_size': batch_size,
@@ -87,14 +106,38 @@ def distributed_recovar_pipeline(args):
                 'n_repeats': n_repeats,
                 'path_mapping': path_mapping,
                 'dataset_loader_dict': dataset_loader_dict,
-            })
-            ckpt_setup.mark_complete()
+            }
+        else:
+            setup = None
+        setup = MPI.COMM_WORLD.bcast(setup, root=0)
+        ckpt_setup = None
+    else:
+        ckpt_setup = StageCheckpoint(checkpoint_dir, "stage_00_setup")
+        if not ckpt_setup.is_complete():
+            if node_config.rank == 0:
+                (cryos, ind_split, options, batch_size, gpu_memory, noise_var_from_hf,
+                 valid_idx, noise_model, n_repeats, path_mapping,
+                 dataset_loader_dict) = stages.stage_setup(args)
 
-        barrier(checkpoint_dir, "setup", node_config.world_size,
-                node_config.job_id, node_config.rank)
+                ckpt_setup.save_object("setup_result", {
+                    'ind_split': ind_split,
+                    'options': options,
+                    'batch_size': batch_size,
+                    'gpu_memory': gpu_memory,
+                    'noise_var_from_hf': noise_var_from_hf,
+                    'valid_idx': valid_idx,
+                    'noise_model': noise_model,
+                    'n_repeats': n_repeats,
+                    'path_mapping': path_mapping,
+                    'dataset_loader_dict': dataset_loader_dict,
+                })
+                ckpt_setup.mark_complete()
 
-    # All ranks load setup results and reconstruct cryos
-    setup = ckpt_setup.load_object("setup_result")
+            barrier(checkpoint_dir, "setup", node_config.world_size,
+                    node_config.job_id, node_config.rank)
+
+        # All ranks load setup results and reconstruct cryos
+        setup = ckpt_setup.load_object("setup_result")
     ind_split = setup['ind_split']
     options = setup['options']
     batch_size = setup['batch_size']
@@ -227,12 +270,14 @@ def distributed_recovar_pipeline(args):
                           column_fscs, picked_frequencies, contrasts_for_second,
                           options, ind_split, path_mapping, st_time)
 
-    # Final barrier so all ranks exit together
+    # Final barrier so all ranks exit together. In MPI mode this dispatches
+    # to MPI.COMM_WORLD.Barrier() (see distributed.barrier).
     barrier(checkpoint_dir, "pipeline_complete", node_config.world_size,
             node_config.job_id, node_config.rank)
 
-    # Cleanup checkpoints
-    if node_config.rank == 0 and not args.keep_checkpoints:
+    # Cleanup checkpoints. Skipped in MPI mode (StageCheckpoint lifecycle
+    # was bypassed; only empty stage dirs would be there).
+    if not _use_mpi() and node_config.rank == 0 and not args.keep_checkpoints:
         import shutil
         logger.info(f"Cleaning up checkpoint directory: {checkpoint_dir}")
         shutil.rmtree(checkpoint_dir, ignore_errors=True)
@@ -247,7 +292,24 @@ def distributed_recovar_pipeline(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     args = add_args(parser).parse_args()
-    distributed_recovar_pipeline(args)
+
+    # When RECOVAR_MPI=1, an uncaught exception on any rank deadlocks the job:
+    # surviving ranks block forever on the next collective. Force-abort the
+    # whole job so SLURM reports the failure and frees the allocation.
+    if _use_mpi():
+        import traceback
+        try:
+            distributed_recovar_pipeline(args)
+        except BaseException:
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+            try:
+                from mpi4py import MPI
+                MPI.COMM_WORLD.Abort(1)
+            except Exception:
+                sys.exit(1)
+    else:
+        distributed_recovar_pipeline(args)
 
 
 if __name__ == "__main__":

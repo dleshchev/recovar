@@ -27,6 +27,7 @@ from recovar.distributed import (
     barrier,
     cleanup_barriers,
     broadcast_value,
+    _use_mpi,
 )
 from recovar.stage_checkpoint import StageCheckpoint
 from recovar import stages
@@ -110,9 +111,124 @@ def distributed_mean(cryos, batch_size, noise_var_from_hf, args, node_config, ch
     # Restore upsampling
     cryo.update_volume_upsampling_factor(original_upsampling)
 
-    # Convert to numpy for writing
-    ft_ctf_partial = np.array(ft_ctf_partial)
-    ft_y_partial = np.array(ft_y_partial)
+    # Convert to numpy (contiguous) for transport.
+    ft_ctf_partial = np.ascontiguousarray(np.array(ft_ctf_partial))
+    ft_y_partial = np.ascontiguousarray(np.array(ft_y_partial))
+
+    # ----------------------------- MPI path ---------------------------------
+    # When RECOVAR_MPI=1: skip NFS partials. Each rank submits two buffers
+    # (one per half) — the half we don't own is zero-filled — and we Reduce
+    # both into rank 0. Rank 0 runs the existing inline post-processing,
+    # then bcasts (means, mean_prior, uninvert_applied) so all ranks return
+    # the same result and the caller's `if uninvert_applied: cryos[*].mult *=
+    # -1` line keeps every rank's local cryos consistent. Sub-communicator
+    # optimisation deferred (Phase 3 mem footprint = 2× ft_ctf + 2× ft_y per
+    # rank in the worst case; tolerable for 128/256-box).
+    if _use_mpi():
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+
+        ft_ctf_h = [None, None]
+        ft_y_h = [None, None]
+        ft_ctf_h[my_half] = ft_ctf_partial
+        ft_y_h[my_half] = ft_y_partial
+        zero_ctf = np.zeros_like(ft_ctf_partial)
+        zero_y = np.zeros_like(ft_y_partial)
+        ft_ctf_h[1 - my_half] = zero_ctf
+        ft_y_h[1 - my_half] = zero_y
+
+        ft_ctfs = [None, None]
+        ft_ys = [None, None]
+        for h in range(2):
+            recv_ctf = np.empty_like(ft_ctf_partial) if node_config.rank == 0 else None
+            recv_y = np.empty_like(ft_y_partial) if node_config.rank == 0 else None
+            comm.Reduce(ft_ctf_h[h], recv_ctf, op=MPI.SUM, root=0)
+            comm.Reduce(ft_y_h[h], recv_y, op=MPI.SUM, root=0)
+            if node_config.rank == 0:
+                ft_ctfs[h] = recv_ctf
+                ft_ys[h] = recv_y
+
+        result = None
+        if node_config.rank == 0:
+            logger.info("Rank 0 (MPI): post-processing reduced ft_ctf/ft_y")
+            means = {}
+            original_upsamplings = []
+            for idx, cryo_h in enumerate(cryos):
+                original_upsamplings.append(cryo_h.volume_upsampling_factor)
+                cryo_h.update_volume_upsampling_factor(upsampling_factor)
+            for idx, cryo_h in enumerate(cryos):
+                means[f"corrected{idx}"] = relion_functions.post_process_from_filter(
+                    cryo_h, ft_ctfs[idx], ft_ys[idx], tau=None, disc_type=disc_type,
+                    use_spherical_mask=True, grid_correct=True,
+                    gridding_correct="square", kernel_width=1
+                )
+            mean_prior, fsc, _ = regularization.compute_relion_prior(
+                cryos, noise_var, means["corrected0"], means["corrected1"],
+                effective_batch_size
+            )
+            means["combined"] = (means["corrected0"] + means["corrected1"]) / 2
+            for idx, cryo_h in enumerate(cryos):
+                means[f"corrected{idx}reg"] = relion_functions.post_process_from_filter(
+                    cryo_h, ft_ctfs[idx], ft_ys[idx], tau=mean_prior, disc_type=disc_type,
+                    use_spherical_mask=True, grid_correct=True,
+                    gridding_correct="square", kernel_width=1
+                )
+                cryo_h.update_volume_upsampling_factor(original_upsamplings[idx])
+            means["combined_regularized"] = (means["corrected0reg"] + means["corrected1reg"]) / 2
+            if use_regularization:
+                means["combined"] = means["combined_regularized"]
+            lhs = (ft_ctfs[0] + ft_ctfs[1]) / 2
+            mean_prior = np.array(mean_prior)
+            means["prior"] = mean_prior
+            means["lhs"] = lhs
+            for key in means:
+                means[key] = np.array(means[key])
+
+            mean_real = ftu.get_idft3(means['combined'].reshape(cryos[0].volume_shape))
+            uninvert_check = np.sum(
+                (mean_real.real ** 3
+                 * cryos[0].get_volume_radial_mask(cryos[0].grid_size // 3).reshape(cryos[0].volume_shape))
+            ) < 0
+            uninvert_applied = False
+            if args.uninvert_data == 'automatic':
+                if uninvert_check:
+                    for key in ['combined', 'init0', 'init1', 'corrected0', 'corrected1']:
+                        if key in means:
+                            means[key] = -means[key]
+                    args.uninvert_data = "true"
+                    logger.warning('sum(mean) < 0! swapping sign of data (uninvert-data = true)')
+                    uninvert_applied = True
+                else:
+                    logger.info('setting (uninvert-data = false)')
+                    args.uninvert_data = "false"
+            elif uninvert_check:
+                logger.warning(
+                    'sum(mean) < 0! Data probably needs to be inverted! '
+                    'set --uninvert-data=true (or automatic)'
+                )
+            if means['combined'].dtype != cryos[0].dtype:
+                logger.warning(f"mean estimate is in type: {means['combined'].dtype}")
+                means['combined'] = means['combined'].astype(cryos[0].dtype)
+
+            result = (means, mean_prior, uninvert_applied)
+
+        # Workers MUST also call bcast — otherwise they deadlock at the next
+        # collective in distributed_mask / etc.
+        result = comm.bcast(result, root=0)
+        means, mean_prior, uninvert_applied = result
+
+        if uninvert_applied:
+            for cryo_h in cryos:
+                cryo_h.image_stack.mult = -1 * cryo_h.image_stack.mult
+            logger.info(f"Rank {node_config.rank}: applied uninvert to local cryos")
+
+        utils.report_memory_device(logger=logger)
+        logger.info(
+            f"Rank {node_config.rank}: mean stage (MPI) completed in "
+            f"{time.time() - st_time:.1f}s"
+        )
+        return means, mean_prior, uninvert_applied
+    # --------------------------- end MPI path -------------------------------
 
     # Write partials
     write_partial(
@@ -276,6 +392,18 @@ def distributed_mask(args, means, volume_shape, dtype_real, cryos, node_config, 
     if node_config.world_size == 1:
         return stages.stage_mask(args, means, volume_shape, dtype_real, cryos)
 
+    # MPI path: rank 0 computes; all ranks bcast. Missing the bcast on workers
+    # deadlocks the next collective in distributed_noise_refine_and_variance.
+    if _use_mpi():
+        from mpi4py import MPI
+        if node_config.rank == 0:
+            result = stages.stage_mask(args, means, volume_shape, dtype_real, cryos)
+            logger.info("Rank 0 (MPI): mask computation complete")
+        else:
+            result = None
+        result = MPI.COMM_WORLD.bcast(result, root=0)
+        return result
+
     if node_config.rank == 0:
         result = stages.stage_mask(args, means, volume_shape, dtype_real, cryos)
         checkpoint.save_object("mask_result", result)
@@ -325,6 +453,22 @@ def distributed_noise_refine_and_variance(cryo, cryos, means, batch_size,
         return stages.stage_noise_refine_and_variance(
             cryo, cryos, means, batch_size, dilated_volume_mask, args, noise_model
         )
+
+    # MPI path: rank 0 computes; all ranks bcast + update local cryos.
+    if _use_mpi():
+        from mpi4py import MPI
+        if node_config.rank == 0:
+            logger.info("Rank 0 (MPI): running noise refinement + variance")
+            result = stages.stage_noise_refine_and_variance(
+                cryo, cryos, means, batch_size, dilated_volume_mask, args, noise_model
+            )
+        else:
+            result = None
+        result = MPI.COMM_WORLD.bcast(result, root=0)
+        noise_var_used = result[0]
+        noise_module.update_noise_variance(noise_var_used, cryos)
+        logger.info(f"Rank {node_config.rank} (MPI): updated local noise model")
+        return result
 
     if node_config.rank == 0:
         logger.info("Rank 0: running noise refinement and variance computation")
@@ -497,8 +641,119 @@ def distributed_covariance_hb(cryos, means, dilated_volume_mask, picked_frequenc
 
     with nvtx.annotate(f"rank{node_config.rank}_to_numpy", color="yellow",
                        domain=NVTX_DOMAIN_DIST):
-        H = np.array(H)
-        B = np.array(B)
+        # Preserve F-order from compute_H_B_in_volume_batch (covariance_estimation
+        # line 525-526 allocates F-order). Default np.array() would force C-order
+        # and silently make column-axis Gatherv send wrong bytes.
+        H = np.asfortranarray(H)
+        B = np.asfortranarray(B)
+
+    # ---------------------------- MPI path ----------------------------------
+    # Frequency-axis Gatherv per half via a sub-communicator (Split by half).
+    # World rank 0 receives the other half from that half's sub-comm root via
+    # point-to-point. At world_size==2 each half_comm has size 1 → Gatherv is
+    # a no-op (matches today's "rank 0 keeps own data, reads partner's once"
+    # fast path). H/B are F-order, so columns concatenate contiguously.
+    if _use_mpi():
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+
+        if H.dtype == np.complex64:
+            mpi_dtype = MPI.C_FLOAT_COMPLEX
+        elif H.dtype == np.float32:
+            mpi_dtype = MPI.FLOAT
+        else:
+            raise ValueError(f"unsupported H/B dtype {H.dtype}")
+
+        volume_size = H.shape[0]
+
+        my_half_assignments = [
+            (r, fa) for r, fa in enumerate(freq_assignments) if fa.half == my_half
+        ]
+        # 256-box: volume_size × n_frequencies = 16M × 300 = ~5e9 elements per H,
+        # which overflows MPI's int32 count argument. Use a contiguous datatype
+        # wrapping one full column (volume_size elements), so Gatherv/Send/Recv
+        # counts are in column-units (≤ n_frequencies, fits easily in int32).
+        column_type = mpi_dtype.Create_contiguous(volume_size).Commit()
+        counts_cols = np.array(
+            [fa.freq_end - fa.freq_start for _, fa in my_half_assignments],
+            dtype=np.int32,
+        )
+        displs_cols = np.zeros_like(counts_cols)
+        np.cumsum(counts_cols[:-1], out=displs_cols[1:])
+
+        half_comm = comm.Split(color=int(my_half), key=int(node_config.rank))
+        try:
+            if half_comm.Get_rank() == 0:
+                H_half = np.empty((volume_size, n_frequencies), dtype=H.dtype, order='F')
+                B_half = np.empty((volume_size, n_frequencies), dtype=B.dtype, order='F')
+            else:
+                H_half = None
+                B_half = None
+
+            my_send_count = my_freq_end - my_freq_start
+
+            with nvtx.annotate(f"rank{node_config.rank}_gatherv_half{my_half}",
+                               color="orange", domain=NVTX_DOMAIN_DIST):
+                if half_comm.Get_rank() == 0:
+                    half_comm.Gatherv([H, my_send_count, column_type],
+                                      [H_half, counts_cols, displs_cols, column_type],
+                                      root=0)
+                    half_comm.Gatherv([B, my_send_count, column_type],
+                                      [B_half, counts_cols, displs_cols, column_type],
+                                      root=0)
+                else:
+                    half_comm.Gatherv([H, my_send_count, column_type], None, root=0)
+                    half_comm.Gatherv([B, my_send_count, column_type], None, root=0)
+        finally:
+            half_comm.Free()
+
+        del H, B  # local pieces no longer needed
+
+        # Combine halves on world rank 0. The "other half"'s root is the
+        # smallest world rank with that half (per compute_frequency_assignments
+        # ordering — half 0's roots come first).
+        Hs = [None, None]
+        Bs = [None, None]
+        if node_config.rank == 0:
+            Hs[my_half] = H_half
+            Bs[my_half] = B_half
+            other_half = 1 - my_half
+            other_root = next(
+                r for r, fa in enumerate(freq_assignments) if fa.half == other_half
+            )
+            H_other = np.empty((volume_size, n_frequencies),
+                               dtype=H_half.dtype, order='F')
+            B_other = np.empty((volume_size, n_frequencies),
+                               dtype=B_half.dtype, order='F')
+            with nvtx.annotate("rank0_recv_other_half", color="cyan",
+                               domain=NVTX_DOMAIN_DIST):
+                # Reuse column_type to avoid int32 count overflow at 256-box.
+                comm.Recv([H_other, n_frequencies, column_type], source=other_root, tag=42)
+                comm.Recv([B_other, n_frequencies, column_type], source=other_root, tag=43)
+            Hs[other_half] = H_other
+            Bs[other_half] = B_other
+            column_type.Free()
+            logger.info(
+                f"Rank 0 (MPI): assembled H/B (shapes "
+                f"{[h.shape for h in Hs]}, dtype={H_half.dtype}) in "
+                f"{time.time() - st_time:.1f}s"
+            )
+            return Hs, Bs
+
+        # Half-root that's not world rank 0: send our half's H/B to world rank 0.
+        # Other ranks (within the half but not half-root) just return.
+        if H_half is not None and node_config.rank != 0:
+            with nvtx.annotate(f"rank{node_config.rank}_send_to_root", color="cyan",
+                               domain=NVTX_DOMAIN_DIST):
+                comm.Send([H_half, n_frequencies, column_type], dest=0, tag=42)
+                comm.Send([B_half, n_frequencies, column_type], dest=0, tag=43)
+            del H_half, B_half
+        column_type.Free()
+        logger.info(
+            f"Rank {node_config.rank} (MPI): done H/B in {time.time() - st_time:.1f}s"
+        )
+        return None, None
+    # -------------------------- end MPI path --------------------------------
 
     # Non-rank-0 nodes: write partials so rank 0 can read them.
     # Rank 0 keeps its own data in memory (no need to write then re-read).
@@ -657,19 +912,33 @@ def distributed_covariance_pca(cryos, options, means, mean_prior, focus_masks,
 
     # --- Phase 3: Distributed H/B computation (all ranks) ---
     # H/B depends on dilated_volume_mask (constant across focus masks),
-    # so we compute it once for all focus mask iterations.
-    ckpt_hb = StageCheckpoint(checkpoint.dir, "hb_distributed")
+    # so we compute it once for all focus mask iterations. In MPI mode,
+    # ckpt_hb is unused (distributed_covariance_hb's MPI branch ignores it).
+    ckpt_hb = None if _use_mpi() else StageCheckpoint(checkpoint.dir, "hb_distributed")
     Hs, Bs = distributed_covariance_hb(
         cryos, means, dilated_volume_mask, picked_frequencies,
         gpu_memory, covariance_options, node_config, ckpt_hb)
 
-    # Non-rank-0: done after H/B. Wait for rank 0 to finish PCA.
-    if node_config.rank != 0:
-        barrier(checkpoint.dir, "covariance_pca", node_config.world_size,
-                node_config.job_id, node_config.rank)
-        result = checkpoint.load_object("covariance_pca_result")
-        logger.info(f"Rank {node_config.rank}: loaded covariance PCA result")
-        return result
+    if _use_mpi():
+        # MPI path: non-rank-0 has Hs=Bs=(None,None). Rank 0 will run the
+        # regularization+SVD loop below, then bcast the result tuple to all.
+        # Workers skip ahead to the bcast at the end of this function.
+        if node_config.rank != 0:
+            from mpi4py import MPI
+            result = MPI.COMM_WORLD.bcast(None, root=0)
+            logger.info(
+                f"Rank {node_config.rank} (MPI): received covariance PCA result via bcast"
+            )
+            return result
+        # Rank 0 falls through to the regularization+SVD code below.
+    else:
+        # Non-rank-0: done after H/B. Wait for rank 0 to finish PCA.
+        if node_config.rank != 0:
+            barrier(checkpoint.dir, "covariance_pca", node_config.world_size,
+                    node_config.job_id, node_config.rank)
+            result = checkpoint.load_object("covariance_pca_result")
+            logger.info(f"Rank {node_config.rank}: loaded covariance PCA result")
+            return result
 
     # --- Phase 4: Rank 0 — regularization + PCA per focus mask ---
     logger.info("Rank 0: starting regularization + PCA")
@@ -778,6 +1047,14 @@ def distributed_covariance_pca(cryos, options, means, mean_prior, focus_masks,
 
     result = (u, s, covariance_cols, picked_frequencies, column_fscs, covariance_options)
 
+    if _use_mpi():
+        # Rank 0: bcast the result so workers can return it. Workers already
+        # called bcast above (just after distributed_covariance_hb).
+        from mpi4py import MPI
+        MPI.COMM_WORLD.bcast(result, root=0)
+        logger.info("Rank 0 (MPI): covariance PCA result broadcast complete")
+        return result
+
     checkpoint.save_object("covariance_pca_result", result)
     logger.info("Rank 0: covariance PCA complete")
 
@@ -819,6 +1096,20 @@ def distributed_embedding(cryos, means, u, s, volume_mask, gpu_memory, options,
             cryos, means, u, s, volume_mask, gpu_memory, options,
             focus_masks, noise_var_used
         )
+
+    # MPI path: rank 0 computes; all ranks bcast.
+    if _use_mpi():
+        from mpi4py import MPI
+        if node_config.rank == 0:
+            logger.info("Rank 0 (MPI): running embedding computation")
+            result = stages.stage_embedding(
+                cryos, means, u, s, volume_mask, gpu_memory, options,
+                focus_masks, noise_var_used
+            )
+        else:
+            result = None
+        result = MPI.COMM_WORLD.bcast(result, root=0)
+        return result
 
     if node_config.rank == 0:
         logger.info("Rank 0: running embedding computation")

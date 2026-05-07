@@ -116,6 +116,10 @@ compare-stage-mean = "bash ./scripts/run_distributed_stage_tests.sh compare mean
 compare-stage-covariance = "bash ./scripts/run_distributed_stage_tests.sh compare covariance_hb 128 100000 1 2"
 compare-all-stages = "python scripts/compare_all_stages.py"
 
+# Distributed stage profiling (nsys + NVTX)
+profile-stage-covariance = "bash ./scripts/run_distributed_stage_tests.sh profile-stage covariance_hb 128"
+profile-stage-mean = "bash ./scripts/run_distributed_stage_tests.sh profile-stage mean 128"
+
 # Smoke test for multi-node
 smoke-multinode = "python scripts/smoke_multinode.py"
 

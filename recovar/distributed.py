@@ -11,10 +11,23 @@ import json
 import time
 import logging
 import numpy as np
+import nvtx
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
+
+NVTX_DOMAIN_DIST = "distributed"
+
+
+def _use_mpi() -> bool:
+    """Return True iff RECOVAR_MPI=1.
+
+    Centralizes the gate: every primitive that has both a file-based and an
+    MPI implementation branches on this. Lazy import of mpi4py keeps the
+    file-based path importable on machines without OpenMPI.
+    """
+    return os.environ.get("RECOVAR_MPI") == "1"
 
 
 @dataclass
@@ -48,6 +61,26 @@ def get_node_config_from_env() -> NodeConfig:
     job_id = os.environ.get("SLURM_JOB_ID", "local")
     config = NodeConfig(rank=rank, world_size=world_size, job_id=job_id)
     logger.info(f"Node config: rank={config.rank}, world_size={config.world_size}, job_id={config.job_id}")
+    return config
+
+
+def get_node_config_from_mpi() -> NodeConfig:
+    """Read node identity from MPI.COMM_WORLD (RECOVAR_MPI=1 path).
+
+    Calling this implicitly initializes MPI if not yet initialized — keep the
+    import inside the function so the file stays usable when mpi4py / OpenMPI
+    are not installed (the file-based path is the fallback during migration).
+    """
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    world_size = comm.Get_size()
+    job_id = os.environ.get("SLURM_JOB_ID", "local")
+    config = NodeConfig(rank=rank, world_size=world_size, job_id=job_id)
+    logger.info(
+        f"Node config (MPI): rank={config.rank}, world_size={config.world_size}, "
+        f"job_id={config.job_id}"
+    )
     return config
 
 
@@ -158,16 +191,20 @@ def write_partial(path: str, array: np.ndarray) -> None:
     tmp_path = path[:-4] + '.tmp.npy'
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    if array.nbytes > 1_000_000_000:
-        logger.info(f"Writing large partial ({array.nbytes / 1e9:.1f} GB) via memmap: {path}")
-        fp = np.lib.format.open_memmap(tmp_path, mode='w+', dtype=array.dtype, shape=array.shape)
-        fp[:] = array
-        del fp  # flush
-    else:
-        np.save(tmp_path, array)
+    st = time.time()
+    size_gb = array.nbytes / 1e9
+    with nvtx.annotate(f"write_partial_{size_gb:.1f}GB", color="red",
+                       domain=NVTX_DOMAIN_DIST):
+        if array.nbytes > 1_000_000_000:
+            logger.info(f"Writing large partial ({size_gb:.1f} GB) via memmap: {path}")
+            fp = np.lib.format.open_memmap(tmp_path, mode='w+', dtype=array.dtype, shape=array.shape)
+            fp[:] = array
+            del fp  # flush
+        else:
+            np.save(tmp_path, array)
 
-    os.rename(tmp_path, path)
-    logger.debug(f"Wrote partial: {path} (shape={array.shape}, dtype={array.dtype})")
+        os.rename(tmp_path, path)
+    logger.info(f"Wrote partial: {path} (shape={array.shape}, {size_gb:.1f} GB, {time.time()-st:.1f}s)")
 
 
 def read_and_reduce_partials(directory: str, pattern: str, reduce: str = 'sum') -> np.ndarray:
@@ -187,10 +224,18 @@ def read_and_reduce_partials(directory: str, pattern: str, reduce: str = 'sum') 
 
     logger.info(f"Reducing {len(files)} partials matching '{pattern}'")
 
-    result = np.load(files[0])
-    for f in files[1:]:
-        result = result + np.load(f)
+    st = time.time()
+    with nvtx.annotate(f"read_reduce_{len(files)}_partials", color="orange",
+                       domain=NVTX_DOMAIN_DIST):
+        result = np.load(files[0])
+        for i, f in enumerate(files[1:], 1):
+            t0 = time.time()
+            arr = np.load(f)
+            load_t = time.time() - t0
+            result = result + arr
+            logger.info(f"  Loaded partial {i}/{len(files)-1}: {f} ({arr.nbytes/1e9:.1f} GB, {load_t:.1f}s)")
 
+    logger.info(f"Reduced {len(files)} partials in {time.time()-st:.1f}s")
     return result
 
 
@@ -212,8 +257,20 @@ def read_and_concat_partials(directory: str, pattern: str, axis: int = 0) -> np.
 
     logger.info(f"Concatenating {len(files)} partials matching '{pattern}' along axis {axis}")
 
-    arrays = [np.load(f) for f in files]
-    return np.concatenate(arrays, axis=axis)
+    st = time.time()
+    with nvtx.annotate(f"read_concat_{len(files)}_partials", color="orange",
+                       domain=NVTX_DOMAIN_DIST):
+        arrays = []
+        for i, f in enumerate(files):
+            t0 = time.time()
+            arr = np.load(f)
+            load_t = time.time() - t0
+            logger.info(f"  Loaded partial {i}/{len(files)}: {f} ({arr.nbytes/1e9:.1f} GB, {load_t:.1f}s)")
+            arrays.append(arr)
+        result = np.concatenate(arrays, axis=axis)
+
+    logger.info(f"Concatenated {len(files)} partials in {time.time()-st:.1f}s")
+    return result
 
 
 def _fsync_directory(directory: str) -> None:
@@ -230,22 +287,31 @@ def _fsync_directory(directory: str) -> None:
 
 
 def barrier(directory: str, name: str, world_size: int, job_id: str,
-            rank: int, timeout: float = 600) -> None:
-    """File-based barrier synchronization.
+            rank: int, timeout: float = 1800) -> None:
+    """Barrier synchronization across ranks.
 
-    Each rank writes a marker file, then polls until all ranks have written theirs.
-    Uses os.stat() per file (more reliable on NFS than os.listdir()).
+    With RECOVAR_MPI=1, dispatches to MPI.COMM_WORLD.Barrier(); otherwise
+    uses the file-based fallback that polls os.stat() on NFS marker files.
+    Function signature is unchanged so callers don't need to branch.
 
     Args:
-        directory: Shared directory for barrier files
-        name: Barrier name (unique per synchronization point)
-        world_size: Total number of ranks
-        job_id: SLURM job ID (prevents stale files from previous runs)
-        rank: This rank's ID
-        timeout: Seconds before raising TimeoutError
+        directory: Shared directory for barrier files (file path only).
+        name: Barrier name (unique per synchronization point in file path).
+        world_size: Total number of ranks.
+        job_id: SLURM job ID (prevents stale files from previous runs).
+        rank: This rank's ID.
+        timeout: Seconds before raising TimeoutError (file path only).
     """
     if world_size == 1:
         return  # No synchronization needed
+
+    if _use_mpi():
+        from mpi4py import MPI
+        with nvtx.annotate(f"mpi_barrier_{name}", color="gray",
+                           domain=NVTX_DOMAIN_DIST):
+            MPI.COMM_WORLD.Barrier()
+        logger.debug(f"Barrier '{name}' (MPI) passed (rank {rank})")
+        return
 
     os.makedirs(directory, exist_ok=True)
 
@@ -264,35 +330,38 @@ def barrier(directory: str, name: str, world_size: int, job_id: str,
         for r in range(world_size)
     ]
 
-    while True:
-        all_present = True
-        for ef in expected_files:
-            try:
-                os.stat(ef)
-            except FileNotFoundError:
-                all_present = False
-                break
-
-        if all_present:
-            logger.debug(f"Barrier '{name}' passed (rank {rank})")
-            return
-
-        elapsed = time.time() - start_time
-        if elapsed > timeout:
-            # Report which ranks are missing
-            missing = []
-            for r, ef in enumerate(expected_files):
+    with nvtx.annotate(f"barrier_{name}_rank{rank}", color="gray",
+                       domain=NVTX_DOMAIN_DIST):
+        while True:
+            all_present = True
+            for ef in expected_files:
                 try:
                     os.stat(ef)
                 except FileNotFoundError:
-                    missing.append(r)
-            raise TimeoutError(
-                f"Barrier '{name}' timed out after {timeout}s. "
-                f"Missing ranks: {missing}. "
-                f"This rank: {rank}, world_size: {world_size}, job_id: {job_id}"
-            )
+                    all_present = False
+                    break
 
-        time.sleep(0.5)
+            if all_present:
+                wait_time = time.time() - start_time
+                logger.info(f"Barrier '{name}' passed (rank {rank}, waited {wait_time:.1f}s)")
+                return
+
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                # Report which ranks are missing
+                missing = []
+                for r, ef in enumerate(expected_files):
+                    try:
+                        os.stat(ef)
+                    except FileNotFoundError:
+                        missing.append(r)
+                raise TimeoutError(
+                    f"Barrier '{name}' timed out after {timeout}s. "
+                    f"Missing ranks: {missing}. "
+                    f"This rank: {rank}, world_size: {world_size}, job_id: {job_id}"
+                )
+
+            time.sleep(0.5)
 
 
 def cleanup_barriers(directory: str, name: str, job_id: str) -> None:
@@ -321,19 +390,18 @@ def mark_stage_complete(stage_dir: str) -> None:
 
 def broadcast_value(directory: str, name: str, value, rank: int,
                     world_size: int, job_id: str) -> Union[np.ndarray, dict]:
-    """Rank 0 writes a value, all ranks read it after barrier.
+    """Broadcast a value from rank 0 to all ranks.
 
-    Args:
-        directory: Shared directory
-        name: Value name (used for filename)
-        value: Value to broadcast (np.ndarray or dict/scalar)
-        rank: This rank's ID
-        world_size: Total number of ranks
-        job_id: SLURM job ID
-
-    Returns:
-        The broadcast value (loaded from disk on all ranks)
+    With RECOVAR_MPI=1, dispatches to MPI.COMM_WORLD.bcast (rank 0 supplies
+    `value`; others' `value` arg is ignored). Otherwise rank 0 writes the
+    value to disk and all ranks read it back after a barrier.
     """
+    if _use_mpi():
+        from mpi4py import MPI
+        with nvtx.annotate(f"mpi_bcast_{name}", color="cyan",
+                           domain=NVTX_DOMAIN_DIST):
+            return MPI.COMM_WORLD.bcast(value, root=0)
+
     os.makedirs(directory, exist_ok=True)
 
     if rank == 0:

@@ -8,11 +8,15 @@ enabling restart from any stage.
 import os
 import json
 import pickle
+import time
 import logging
 import numpy as np
+import nvtx
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+NVTX_DOMAIN_DIST = "distributed"
 
 
 class StageCheckpoint:
@@ -79,17 +83,28 @@ class StageCheckpoint:
     def save_object(self, name: str, obj: Any) -> str:
         """Save arbitrary Python object as pickle."""
         path = os.path.join(self._dir, f"{name}.pkl")
-        logger.info(f"Saving object: {name} (type={type(obj).__name__})")
-        with open(path, 'wb') as f:
-            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        st = time.time()
+        with nvtx.annotate(f"save_object_{name}", color="purple",
+                           domain=NVTX_DOMAIN_DIST):
+            logger.info(f"Saving object: {name} (type={type(obj).__name__})")
+            with open(path, 'wb') as f:
+                pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        size_mb = os.path.getsize(path) / 1e6
+        logger.info(f"Saved object: {name} ({size_mb:.0f} MB, {time.time()-st:.1f}s)")
         return path
 
     def load_object(self, name: str) -> Any:
         """Load object from pickle."""
         path = os.path.join(self._dir, f"{name}.pkl")
-        logger.info(f"Loading object: {name}")
-        with open(path, 'rb') as f:
-            return pickle.load(f)
+        st = time.time()
+        with nvtx.annotate(f"load_object_{name}", color="blue",
+                           domain=NVTX_DOMAIN_DIST):
+            logger.info(f"Loading object: {name}")
+            with open(path, 'rb') as f:
+                result = pickle.load(f)
+        size_mb = os.path.getsize(path) / 1e6
+        logger.info(f"Loaded object: {name} ({size_mb:.0f} MB, {time.time()-st:.1f}s)")
+        return result
 
     def is_complete(self) -> bool:
         """Check if stage has completed (DONE marker exists)."""

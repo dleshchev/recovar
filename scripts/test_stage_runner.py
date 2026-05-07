@@ -223,16 +223,35 @@ def run_stage(args):
         elapsed = time.time() - st_time
 
         if node_config.rank == 0:
-            # Save result for comparison (distributed path saves via checkpoint,
-            # but single-node path returns directly without saving)
-            if not ckpt.has_object("covariance_hb_result"):
-                ckpt.save_object("covariance_hb_result", (Hs, Bs))
-                ckpt.mark_complete()
+            # Save result as individual numpy arrays for comparison.
+            # For world_size >= 4, results may already be memmap files
+            # in the checkpoint dir (assembled_half*), so just symlink them.
+            save_t = time.time()
+            for h in range(2):
+                assembled_path = os.path.join(
+                    ckpt._dir, f"assembled_half{h}_H.npy")
+                target_path = os.path.join(ckpt._dir, f"half{h}_H.npy")
+                if os.path.exists(assembled_path) and not os.path.exists(target_path):
+                    os.rename(assembled_path, target_path)
+                    logger.info(f"Renamed assembled_half{h}_H.npy -> half{h}_H.npy")
+                else:
+                    ckpt.save_array(f"half{h}_H", np.array(Hs[h]))
+
+                assembled_path = os.path.join(
+                    ckpt._dir, f"assembled_half{h}_B.npy")
+                target_path = os.path.join(ckpt._dir, f"half{h}_B.npy")
+                if os.path.exists(assembled_path) and not os.path.exists(target_path):
+                    os.rename(assembled_path, target_path)
+                    logger.info(f"Renamed assembled_half{h}_B.npy -> half{h}_B.npy")
+                else:
+                    ckpt.save_array(f"half{h}_B", np.array(Bs[h]))
+            ckpt.mark_complete()
+            logger.info(f"Saved H/B arrays for comparison in {time.time()-save_t:.1f}s")
             ckpt.save_config({
                 "stage": "covariance_hb", "elapsed_s": elapsed,
                 "world_size": node_config.world_size,
                 "n_frequencies": len(picked_frequencies),
-                "H_shapes": [h.shape for h in Hs] if Hs else [],
+                "H_shapes": [h.shape for h in Hs],
             })
             logger.info(f"Stage 'covariance_hb' completed in {elapsed:.1f}s")
 
@@ -340,11 +359,18 @@ def compare_outputs(args):
         ref_ckpt = StageCheckpoint(ref_dir, "stage_05_covariance")
         test_ckpt = StageCheckpoint(test_dir, "stage_05_covariance")
 
-        ref_result = ref_ckpt.load_object("covariance_hb_result")
-        test_result = test_ckpt.load_object("covariance_hb_result")
+        # Load H/B arrays — supports both old pickle format and new array format
+        def _load_hb(ckpt):
+            if ckpt.has_array("half0_H"):
+                Hs = [ckpt.load_array(f"half{h}_H") for h in range(2)]
+                Bs = [ckpt.load_array(f"half{h}_B") for h in range(2)]
+            else:
+                result = ckpt.load_object("covariance_hb_result")
+                Hs, Bs = result
+            return Hs, Bs
 
-        ref_Hs, ref_Bs = ref_result
-        test_Hs, test_Bs = test_result
+        ref_Hs, ref_Bs = _load_hb(ref_ckpt)
+        test_Hs, test_Bs = _load_hb(test_ckpt)
 
         for h in range(2):
             for name, ref_v, test_v in [("H", ref_Hs[h], test_Hs[h]), ("B", ref_Bs[h], test_Bs[h])]:

@@ -522,8 +522,13 @@ def compute_H_B_in_volume_batch(cryo, mean, dilated_volume_mask, picked_frequenc
     # Check if multi-GPU should be used
     n_gpus = _get_n_usable_gpus_for_covariance(cryo.volume_size, picked_frequencies.size, cryo.dtype)
 
-    H = np.empty( [cryo.volume_size, picked_frequencies.size] , dtype = cryo.dtype)
-    B = np.empty( [cryo.volume_size, picked_frequencies.size] , dtype = cryo.dtype)
+    # F-order so column-axis Gatherv (Phase 4 in the MPI migration) sees a
+    # contiguous slab per frequency. C-order silently sends wrong bytes when
+    # the column count varies per rank. Single-node perf is unchanged because
+    # the inner kernels operate on freshly-allocated [vol, batch] slabs that
+    # we copy *into* the F-order columns via the assignment below.
+    H = np.empty([cryo.volume_size, picked_frequencies.size], dtype=cryo.dtype, order='F')
+    B = np.empty([cryo.volume_size, picked_frequencies.size], dtype=cryo.dtype, order='F')
     frequency_batch = column_batch_size
 
     for k in range(0, int(np.ceil(picked_frequencies.size/frequency_batch))):
